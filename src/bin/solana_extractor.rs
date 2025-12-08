@@ -1032,7 +1032,7 @@ fn build_schema() -> SchemaRef {
         Field::new("err", DataType::Utf8, true),
         Field::new(
             "instructions",
-            DataType::List(Arc::new(Field::new("item", instruction_struct, false))),
+            DataType::List(Arc::new(Field::new("item", instruction_struct, true))),
             false,
         ),
     ]))
@@ -1101,10 +1101,20 @@ fn flush_batch(
         vec![
             Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
             Box::new(StringBuilder::new()),
-            Box::new(ListBuilder::new(StringBuilder::new())),
+            Box::new(ListBuilder::with_field(
+                Field::new("item", DataType::Utf8, true),
+                StringBuilder::new(),
+            )),
         ],
     );
-    let mut instructions_builder = ListBuilder::new(instruction_struct_builder);
+    let mut instructions_builder = ListBuilder::with_field(
+        Field::new(
+            "item",
+            DataType::Struct(instruction_struct_builder.fields().clone()),
+            true,
+        ),
+        instruction_struct_builder,
+    );
 
     let mut log_messages_builder = ListBuilder::new(StringBuilder::new());
     let mut err_builder = StringBuilder::new();
