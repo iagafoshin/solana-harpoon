@@ -1,0 +1,33 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # serde_cbor 0.11.2 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2021-0127
+    "RUSTSEC-2021-0127",
+
+    # atty 0.2.14 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2021-0145
+    "RUSTSEC-2021-0145",
+
+    # ed25519-dalek 1.0.1 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2022-0093
+    "RUSTSEC-2022-0093",
+
+    # curve25519-dalek 3.2.0 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0344
+    "RUSTSEC-2024-0344",
+
+    # atty 0.2.14 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0375
+    "RUSTSEC-2024-0375",
+
+    # derivative 2.2.0 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0388
+    "RUSTSEC-2024-0388",
+
+    # paste 1.0.15 registry+https://github.com/rust-lang/crates.io-index
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+]
