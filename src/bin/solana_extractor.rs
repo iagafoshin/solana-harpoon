@@ -1016,12 +1016,12 @@ fn build_schema() -> SchemaRef {
         Field::new("fee", DataType::UInt64, false),
         Field::new(
             "account_balance_deltas",
-            DataType::List(Arc::new(Field::new("item", account_balance_struct, false))),
+            DataType::List(Arc::new(Field::new("item", account_balance_struct, true))),
             false,
         ),
         Field::new(
             "token_balance_deltas",
-            DataType::List(Arc::new(Field::new("item", token_balance_struct, false))),
+            DataType::List(Arc::new(Field::new("item", token_balance_struct, true))),
             false,
         ),
         Field::new(
