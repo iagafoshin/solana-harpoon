@@ -1,10 +1,12 @@
 use {
     aho_corasick::AhoCorasick,
     anyhow::{Context, anyhow},
-    arrow::record_batch::RecordBatch,
     arrow_array::{
-        ArrayRef, Int64Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
-        UInt64Builder, builder::ArrayBuilder,
+        ArrayRef, RecordBatch,
+        builder::{
+            ArrayBuilder, Int64Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
+            UInt64Builder,
+        },
     },
     arrow_schema::{DataType, Field, Fields, Schema, SchemaRef},
     bs58,
@@ -789,7 +791,7 @@ fn process_prepared_tx(
             .and_then(|meta| meta.log_messages.as_ref().cloned()),
         err: meta
             .as_ref()
-            .and_then(|meta| meta.err.as_ref().map(|e| e.to_string())),
+            .and_then(|meta| meta.status.as_ref().err().map(|e| format!("{e:?}"))),
         instructions: parsed_instructions,
     };
     #[cfg(feature = "timing")]
@@ -809,17 +811,6 @@ fn decode_transaction_status_meta(buffer: &[u8]) -> anyhow::Result<TransactionSt
         DecodedData::Protobuf(value) => TransactionStatusMeta::try_from(value)
             .map_err(|err| anyhow!("failed to convert proto tx metadata: {err}")),
     }
-}
-
-fn instruction_targets_program(
-    ix: &CompiledInstruction,
-    account_keys: &[Pubkey],
-    target_programs: &HashSet<Pubkey>,
-) -> bool {
-    account_keys
-        .get(ix.program_id_index as usize)
-        .map(|program_id| target_programs.contains(program_id))
-        .unwrap_or(false)
 }
 
 fn resolve_program_id(account_keys: &[Pubkey], program_id_index: u8) -> String {
@@ -1056,13 +1047,12 @@ fn flush_batch(
         return Ok(());
     }
 
-    let batch_size = buffer.len();
-    let mut slot_builder = UInt64Builder::new(batch_size);
-    let mut block_time_builder = Int64Builder::new(batch_size);
-    let mut signatures_builder = ListBuilder::new(StringBuilder::new(0));
-    let mut accounts_builder = ListBuilder::new(StringBuilder::new(0));
-    let mut program_ids_builder = ListBuilder::new(StringBuilder::new(0));
-    let mut fee_builder = UInt64Builder::new(batch_size);
+    let mut slot_builder = UInt64Builder::new();
+    let mut block_time_builder = Int64Builder::new();
+    let mut signatures_builder = ListBuilder::new(StringBuilder::new());
+    let mut accounts_builder = ListBuilder::new(StringBuilder::new());
+    let mut program_ids_builder = ListBuilder::new(StringBuilder::new());
+    let mut fee_builder = UInt64Builder::new();
 
     let account_balance_struct_builder = StructBuilder::new(
         vec![
@@ -1072,10 +1062,10 @@ fn flush_batch(
             Field::new("delta_lamports", DataType::Int64, false),
         ],
         vec![
-            Box::new(StringBuilder::new(0)) as Box<dyn ArrayBuilder>,
-            Box::new(UInt64Builder::new(0)),
-            Box::new(UInt64Builder::new(0)),
-            Box::new(Int64Builder::new(0)),
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            Box::new(UInt64Builder::new()),
+            Box::new(UInt64Builder::new()),
+            Box::new(Int64Builder::new()),
         ],
     );
     let mut account_balance_builder = ListBuilder::new(account_balance_struct_builder);
@@ -1089,11 +1079,11 @@ fn flush_batch(
             Field::new("post_ui_amount", DataType::Utf8, true),
         ],
         vec![
-            Box::new(StringBuilder::new(0)) as Box<dyn ArrayBuilder>,
-            Box::new(StringBuilder::new(0)),
-            Box::new(UInt32Builder::new(0)),
-            Box::new(StringBuilder::new(0)),
-            Box::new(StringBuilder::new(0)),
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            Box::new(StringBuilder::new()),
+            Box::new(UInt32Builder::new()),
+            Box::new(StringBuilder::new()),
+            Box::new(StringBuilder::new()),
         ],
     );
     let mut token_balance_builder = ListBuilder::new(token_balance_struct_builder);
@@ -1109,15 +1099,15 @@ fn flush_batch(
             ),
         ],
         vec![
-            Box::new(StringBuilder::new(0)) as Box<dyn ArrayBuilder>,
-            Box::new(StringBuilder::new(0)),
-            Box::new(ListBuilder::new(StringBuilder::new(0))),
+            Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            Box::new(StringBuilder::new()),
+            Box::new(ListBuilder::new(StringBuilder::new())),
         ],
     );
     let mut instructions_builder = ListBuilder::new(instruction_struct_builder);
 
-    let mut log_messages_builder = ListBuilder::new(StringBuilder::new(0));
-    let mut err_builder = StringBuilder::new(batch_size);
+    let mut log_messages_builder = ListBuilder::new(StringBuilder::new());
+    let mut err_builder = StringBuilder::new();
 
     for record in buffer.iter() {
         slot_builder.append_value(record.slot);
@@ -1130,19 +1120,19 @@ fn flush_batch(
         for sig in &record.signatures {
             sigs_values.append_value(sig);
         }
-        signatures_builder.append(true)?;
+        signatures_builder.append(true);
 
         let accounts_values = accounts_builder.values();
         for account in &record.accounts {
             accounts_values.append_value(account);
         }
-        accounts_builder.append(true)?;
+        accounts_builder.append(true);
 
         let program_ids_values = program_ids_builder.values();
         for program_id in &record.program_ids {
             program_ids_values.append_value(program_id);
         }
-        program_ids_builder.append(true)?;
+        program_ids_builder.append(true);
 
         fee_builder.append_value(record.fee);
 
@@ -1164,9 +1154,9 @@ fn flush_batch(
                 .field_builder::<Int64Builder>(3)
                 .unwrap()
                 .append_value(delta.delta_lamports);
-            ab_values.append(true)?;
+            ab_values.append(true);
         }
-        account_balance_builder.append(true)?;
+        account_balance_builder.append(true);
 
         let tb_values = token_balance_builder.values();
         for delta in &record.token_balance_deltas {
@@ -1202,9 +1192,9 @@ fn flush_batch(
                     .unwrap()
                     .append_null(),
             }
-            tb_values.append(true)?;
+            tb_values.append(true);
         }
-        token_balance_builder.append(true)?;
+        token_balance_builder.append(true);
 
         match &record.log_messages {
             Some(logs) => {
@@ -1212,10 +1202,10 @@ fn flush_batch(
                 for log in logs {
                     logs_values.append_value(log);
                 }
-                log_messages_builder.append(true)?;
+                log_messages_builder.append(true);
             }
             None => {
-                log_messages_builder.append(false)?;
+                log_messages_builder.append(false);
             }
         }
 
@@ -1241,10 +1231,10 @@ fn flush_batch(
             for account in &inst.accounts {
                 accounts_values.append_value(account);
             }
-            accounts_builder.append(true)?;
-            inst_values.append(true)?;
+            accounts_builder.append(true);
+            inst_values.append(true);
         }
-        instructions_builder.append(true)?;
+        instructions_builder.append(true);
     }
 
     let arrays: Vec<ArrayRef> = vec![
