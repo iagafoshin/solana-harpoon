@@ -51,22 +51,9 @@ const-hex = "1.14.1"
 [features]
 default = []
 counter = [
-    "dep:anyhow",
-    "dep:base64",
-    "dep:bincode",
-    "dep:clap",
-    "dep:indicatif",
-    "dep:prost",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:solana-sdk",
-    "dep:solana-storage-proto",
-    "dep:solana-transaction-status",
-    "dep:rayon",
     "tokio/fs",
     "tokio/macros",
-    "tokio/rt-multi-thread",
-    "dep:zstd"
+    "tokio/rt-multi-thread"
 ]
 timing = []
 
