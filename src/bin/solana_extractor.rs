@@ -1032,7 +1032,7 @@ fn build_schema() -> SchemaRef {
         Field::new("err", DataType::Utf8, true),
         Field::new(
             "instructions",
-            DataType::List(Arc::new(Field::new("item", instruction_struct, false))),
+            DataType::List(Arc::new(Field::new("item", instruction_struct, true))),
             false,
         ),
     ]))
