@@ -990,7 +990,7 @@ fn build_schema() -> SchemaRef {
         Field::new("data", DataType::Utf8, false),
         Field::new(
             "accounts",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
     ]));
