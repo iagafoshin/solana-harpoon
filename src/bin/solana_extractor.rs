@@ -1000,17 +1000,17 @@ fn build_schema() -> SchemaRef {
         Field::new("block_time", DataType::Int64, true),
         Field::new(
             "signatures",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
         Field::new(
             "accounts",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
         Field::new(
             "program_ids",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
         Field::new("fee", DataType::UInt64, false),
@@ -1026,7 +1026,7 @@ fn build_schema() -> SchemaRef {
         ),
         Field::new(
             "log_messages",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             true,
         ),
         Field::new("err", DataType::Utf8, true),
@@ -1094,7 +1094,7 @@ fn flush_batch(
             Field::new("data", DataType::Utf8, false),
             Field::new(
                 "accounts",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 false,
             ),
         ],
