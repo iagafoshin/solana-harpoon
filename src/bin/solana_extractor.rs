@@ -1,6 +1,5 @@
 use {
-    aho_corasick::AhoCorasick,
-    anyhow::{Context, anyhow},
+    anyhow::{anyhow, Context},
     arrow_array::{
         ArrayRef, RecordBatch,
         builder::{
@@ -10,37 +9,55 @@ use {
     },
     arrow_schema::{DataType, Field, Fields, Schema, SchemaRef},
     bs58,
+    bytes::Bytes,
     clap::Parser,
-    indicatif::{MultiProgress, ProgressBar, ProgressStyle},
-    parquet::arrow::ArrowWriter,
+    futures_util::TryStreamExt,
+    parquet::{
+        arrow::ArrowWriter,
+        basic::{Compression, ZstdLevel},
+        file::properties::WriterProperties,
+    },
     prost::Message,
     rayon::prelude::*,
-    serde::{Deserialize, Serialize},
+    reqwest::Client,
+    serde::Serialize,
     solana_sdk::{
         instruction::CompiledInstruction, message::VersionedMessage, pubkey::Pubkey,
         transaction::VersionedTransaction,
     },
-    solana_storage_proto::{StoredTransactionStatusMeta, convert::generated},
+    solana_storage_proto::{convert::generated, StoredTransactionStatusMeta},
     solana_transaction_status::{TransactionStatusMeta, TransactionTokenBalance},
     std::{
-        collections::{BTreeMap, BTreeSet, HashSet},
+        borrow::Cow,
+        collections::{BTreeMap, HashSet},
         convert::TryFrom,
         path::PathBuf,
         process::Command,
         str::FromStr,
         sync::{
-            Arc,
             atomic::{AtomicU64, Ordering},
+            mpsc::sync_channel,
+            Arc,
         },
         time::{Duration, Instant},
     },
-    tokio::{fs, fs::File, io::BufReader},
+    tikv_jemallocator::Jemalloc,
+    tokio::{
+        fs, fs::File,
+        io::{self, AsyncRead, BufReader},
+    },
+    tokio_util::io::StreamReader,
     yellowstone_faithful_car_parser::node::{Node, NodeReader, Nodes},
 };
 
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 const DEFAULT_PROGRAMS: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PROGRESS_INTERVAL: u64 = 10_000;
-const BATCH_SIZE: usize = 5_000;
+const BATCH_SIZE: usize = 50_000;
+const RAYON_CHUNK_SIZE: usize = 5_000;
+const TIMING_SAMPLE_RATE: u64 = 256;
 
 #[derive(Debug, Parser, Clone)]
 #[clap(author, version, about = "generic Solana CAR extractor")]
@@ -57,21 +74,17 @@ struct Args {
     #[clap(long, default_value = "./data")]
     pub data_dir: PathBuf,
 
-    /// Maximum number of epochs processed concurrently
-    #[clap(short = 'j', long, default_value_t = 4)]
-    pub concurrency: usize,
-
-    /// Parse Nodes from CAR file
-    #[clap(long)]
-    pub parse: bool,
-
-    /// Decode Nodes to Solana structs
-    #[clap(long)]
-    pub decode: bool,
-
     /// Target program ids (comma-separated)
     #[clap(long)]
     pub program: Option<String>,
+
+    /// Stream-download CAR files directly over HTTP without saving to disk
+    #[clap(long)]
+    pub stream_download: bool,
+
+    /// Keep downloaded CAR files on disk
+    #[clap(long)]
+    pub keep_car: bool,
 }
 
 #[tokio::main]
@@ -93,37 +106,51 @@ async fn main() -> anyhow::Result<()> {
     if target_programs.is_empty() {
         return Err(anyhow!("no program ids provided"));
     }
-    let target_program_bytes: Vec<Vec<u8>> = target_programs
-        .iter()
-        .map(|p| p.to_bytes().to_vec())
-        .collect();
-    let searcher = Arc::new(
-        AhoCorasick::new(target_program_bytes).context("failed to build aho-corasick searcher")?,
-    );
-    let target_programs = Arc::new(target_programs);
+    let target_programs = Arc::new(target_programs.into_iter().collect::<HashSet<Pubkey>>());
+
+    if args.num_epochs == 0 {
+        return Ok(());
+    }
+
+    let available_epochs = args.latest_epoch.saturating_add(1);
+    let epochs_to_process = args.num_epochs.min(available_epochs);
+    if epochs_to_process < args.num_epochs {
+        eprintln!(
+            "[warn] requested num_epochs={} but only {} epochs available from latest_epoch={}; processing {} epochs",
+            args.num_epochs,
+            available_epochs,
+            args.latest_epoch,
+            epochs_to_process
+        );
+    }
+
     eprintln!(
-        "Starting pipeline for programs [{}] across {} epochs (latest={}), concurrency={}",
-        program_list, args.num_epochs, args.latest_epoch, args.concurrency
+        "Starting pipeline for programs [{}] across {} epochs (latest={})",
+        program_list, epochs_to_process, args.latest_epoch
     );
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
-    let mut handles = Vec::new();
+    for offset in 0..epochs_to_process {
+        let epoch = args.latest_epoch - offset;
+        let car_filename = format!("epoch-{epoch}.car");
+        let temp_filename = format!("{car_filename}.part");
+        let parquet_filename = format!("whales-epoch-{epoch}.parquet");
+        let car_path = args.data_dir.join(&car_filename);
+        let temp_car_path = args.data_dir.join(&temp_filename);
+        let output_path = args.data_dir.join(&parquet_filename);
 
-    for offset in 0..args.num_epochs {
-        let epoch = args.latest_epoch.saturating_sub(offset);
-        let args_clone = args.clone();
-        let sem = semaphore.clone();
-        let permit = sem.acquire_owned().await?;
-        let target_programs = target_programs.clone();
-        let searcher = searcher.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = permit;
-            let car_filename = format!("epoch-{epoch}.car");
-            let parquet_filename = format!("whales-epoch-{epoch}.parquet");
-            let car_path = args_clone.data_dir.join(&car_filename);
-            let output_path = args_clone.data_dir.join(&parquet_filename);
-
+        if args.stream_download {
+            let url = format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car");
+            eprintln!(
+                "Streaming epoch {epoch} from {url} -> {:?}",
+                output_path
+            );
+            process_network_stream(
+                &url,
+                output_path,
+                target_programs.clone(),
+            )
+            .await?;
+        } else {
             if !car_path.exists() {
                 let url = format!("https://files.old-faithful.net/{epoch}/epoch-{epoch}.car");
                 eprintln!("Downloading epoch {epoch} from {url}");
@@ -134,104 +161,105 @@ async fn main() -> anyhow::Result<()> {
                     .arg("16")
                     .arg("-k")
                     .arg("4M")
+                    .arg("--auto-file-renaming=false")
+                    .arg("--allow-overwrite=true")
+                    .arg("-c")
                     .arg("-o")
-                    .arg(&car_filename)
+                    .arg(&temp_filename)
                     .arg(&url)
-                    .current_dir(&args_clone.data_dir)
+                    .current_dir(&args.data_dir)
                     .status()
                     .context("failed to spawn aria2c")?;
                 if !status.success() {
                     return Err(anyhow!("aria2c failed for epoch {epoch}"));
                 }
+                std::fs::rename(&temp_car_path, &car_path).with_context(|| {
+                    format!(
+                        "failed to rename downloaded temp file {:?} to {:?}",
+                        temp_car_path, car_path
+                    )
+                })?;
             }
 
-            process_epoch_file(
-                car_path.clone(),
+            eprintln!(
+                "Processing CAR {:?} -> {:?} for programs [{}]",
+                car_path,
                 output_path,
-                &args_clone,
-                target_programs,
-                searcher,
+                target_programs
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            let file = File::open(&car_path)
+                .await
+                .context("failed to open CAR file")?;
+            process_stream(
+                Box::new(file),
+                output_path,
+                target_programs.clone(),
             )
             .await?;
-            fs::remove_file(&car_path)
-                .await
-                .context("failed to remove downloaded CAR")?;
-
-            Ok::<_, anyhow::Error>(())
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .context("task join error")?
-            .context("task failed")?;
+            if !args.keep_car {
+                fs::remove_file(&car_path)
+                    .await
+                    .context("failed to remove downloaded CAR")?;
+            }
+        }
     }
 
     Ok(())
 }
 
-async fn process_epoch_file(
-    car_path: PathBuf,
+async fn process_stream(
+    input: Box<dyn AsyncRead + Unpin + Send>,
     output_path: PathBuf,
-    args: &Args,
-    target_programs: Arc<Vec<Pubkey>>,
-    searcher: Arc<AhoCorasick>,
+    target_programs: Arc<HashSet<Pubkey>>,
 ) -> anyhow::Result<()> {
-    let target_program_set: HashSet<Pubkey> = target_programs.iter().cloned().collect();
-    eprintln!(
-        "Processing CAR {:?} -> {:?} for programs [{}]",
-        car_path,
-        output_path,
-        target_programs
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-
-    let file = File::open(&car_path)
-        .await
-        .context("failed to open CAR file")?;
-    let mut reader = NodeReader::new(BufReader::new(file));
-
-    if !args.parse {
-        let bar = ProgressBar::no_length()
-            .with_style(ProgressStyle::with_template("{spinner} {pos}").expect("valid template"));
-        let mut counter = 0;
-        while reader.read_node().await?.is_some() {
-            counter += 1;
-            if counter >= 131_072 {
-                bar.inc(counter);
-                counter = 0;
-            }
-        }
-        bar.inc(counter);
-        bar.finish();
-        return Ok(());
-    }
+    let mut reader = NodeReader::new(BufReader::new(input));
 
     let output_file = std::fs::File::create(&output_path)
         .with_context(|| format!("failed to create {:?}", output_path))?;
+    let writer_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
     let schema = build_schema();
-    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), None)
+    let writer = ArrowWriter::try_new(output_file, schema.clone(), Some(writer_props))
         .context("failed to create parquet writer")?;
+    let timing = Arc::new(TimingStats::default());
+    let (batch_tx, batch_rx) = sync_channel::<Vec<WhalesV1Record>>(4);
+    // Dedicated writer thread owns the ArrowWriter to avoid blocking the async runtime.
+    let writer_handle = std::thread::spawn({
+        let schema = schema.clone();
+        let timing = timing.clone();
+        move || -> anyhow::Result<()> {
+            let mut writer = writer;
+            for batch in batch_rx.iter() {
+                let start = Instant::now();
+                let batch_len = batch.len();
+                flush_batch_sync(&schema, &mut writer, batch)
+                    .with_context(|| format!("parquet_write failed for batch size {batch_len}"))?;
+                timing.record(
+                    &timing.parquet_write_ns,
+                    &timing.parquet_write_samples,
+                    start.elapsed(),
+                    true,
+                );
+            }
+            writer
+                .close()
+                .with_context(|| "parquet_close failed while finalizing writer".to_string())?;
+            Ok(())
+        }
+    });
     let mut buffer: Vec<WhalesV1Record> = Vec::new();
 
     let start_time = Instant::now();
     let stats = Stats::default();
     let mut first_slot = None;
     let mut last_slot = None;
-    let progress_ui = StatsProgress::new();
-    progress_ui.update(&stats, last_slot, start_time);
-
     loop {
-        #[cfg(feature = "timing")]
-        let read_start = Instant::now();
         let nodes = Nodes::read_until_block(&mut reader).await?;
-        #[cfg(feature = "timing")]
-        timing_add(TimingPhase::ReadNodes, read_start.elapsed());
         if nodes.nodes.is_empty() {
             break;
         }
@@ -240,8 +268,6 @@ async fn process_epoch_file(
             Node::Block(block) => i64::try_from(block.meta.blocktime).ok(),
             _ => None,
         });
-        #[cfg(feature = "timing")]
-        let prepare_start = Instant::now();
         let mut prepared_txs = Vec::new();
 
         for node in nodes.nodes.values() {
@@ -253,75 +279,124 @@ async fn process_epoch_file(
                     last_slot = Some(frame.slot);
                     let total = stats.total_transactions.fetch_add(1, Ordering::Relaxed) + 1;
                     if total % PROGRESS_INTERVAL == 0 {
-                        progress_ui.update(&stats, last_slot, start_time);
+                        print_progress(&stats, last_slot, start_time);
                     }
 
-                    if !args.decode {
-                        continue;
-                    }
-
-                    if searcher.find(frame.data.data.as_slice()).is_none() {
-                        continue;
-                    }
-
-                    let metadata_frames = nodes
-                        .reassemble_dataframes(&frame.metadata)
-                        .context("failed to reassemble tx metadata")?;
-                    let meta_data = if metadata_frames.is_empty() {
-                        None
-                    } else {
-                        Some(metadata_frames)
+                    let meta_data = match nodes.reassemble_dataframes(&frame.metadata) {
+                        Ok(bytes) if bytes.is_empty() => None,
+                        Ok(bytes) => Some(Bytes::from(bytes)),
+                        Err(err) => {
+                            eprintln!(
+                                "[warn] slot={} failed to reassemble tx metadata: {err}",
+                                frame.slot
+                            );
+                            stats.metadata_errors.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
                     };
                     prepared_txs.push(PreparedTx {
                         slot: frame.slot,
                         block_time,
-                        tx_data: frame.data.data.clone(),
+                        // Cloning is required because `frame` is borrowed from `nodes`; we cannot take ownership of the buffer.
+                        tx_data: Bytes::from(frame.data.data.clone()),
                         meta_data,
                     });
-                }
-                Node::Rewards(frame) => {
-                    if !args.decode {
-                        continue;
+                    if prepared_txs.len() >= RAYON_CHUNK_SIZE {
+                        let chunk: Vec<_> = prepared_txs.drain(..RAYON_CHUNK_SIZE).collect();
+                        let records = process_prepared_transactions(
+                            chunk,
+                            &target_programs,
+                            &stats,
+                            timing.as_ref(),
+                        );
+                        buffer.extend(records);
+                        while buffer.len() >= BATCH_SIZE {
+                            let batch: Vec<_> = buffer.drain(..BATCH_SIZE).collect();
+                            batch_tx
+                                .send(batch)
+                                .map_err(|_| {
+                                    anyhow!("failed to send parquet batch to writer thread")
+                                })?;
+                        }
                     }
-
-                    let buffer = nodes
-                        .reassemble_dataframes(&frame.data)
-                        .context("failed to reassemble rewards")?;
-                    let buffer = zstd::decode_all(buffer.as_slice())
-                        .context("failed to decompress rewards")?;
-                    let _ = decode_protobuf_bincode::<Vec<StoredBlockReward>, generated::Rewards>(
-                        "rewards", &buffer,
-                    );
                 }
                 Node::Block(_) => {
                     stats.total_blocks.fetch_add(1, Ordering::Relaxed);
                 }
-                Node::Entry(_) | Node::Subset(_) | Node::Epoch(_) | Node::DataFrame(_) => (),
+                Node::Rewards(_) | Node::Entry(_) | Node::Subset(_) | Node::Epoch(_) | Node::DataFrame(_) => (),
             }
         }
 
-        #[cfg(feature = "timing")]
-        timing_add(TimingPhase::PrepareTxs, prepare_start.elapsed());
-
-        if args.decode && !prepared_txs.is_empty() {
-            let records = process_prepared_transactions(prepared_txs, &target_program_set, &stats);
+        // Backpressure: process prepared txs in bounded chunks to avoid ballooning memory when many match.
+        while prepared_txs.len() >= RAYON_CHUNK_SIZE {
+            let chunk: Vec<_> = prepared_txs.drain(..RAYON_CHUNK_SIZE).collect();
+            let records =
+                process_prepared_transactions(chunk, &target_programs, &stats, timing.as_ref());
             buffer.extend(records);
-            if buffer.len() >= BATCH_SIZE {
-                flush_batch(&schema, &mut writer, &mut buffer)?;
+            while buffer.len() >= BATCH_SIZE {
+                let batch: Vec<_> = buffer.drain(..BATCH_SIZE).collect();
+                batch_tx
+                    .send(batch)
+                    .map_err(|_| anyhow!("failed to send parquet batch to writer thread"))?;
+            }
+        }
+        if !prepared_txs.is_empty() {
+            let chunk: Vec<_> = prepared_txs.drain(..).collect();
+            let records =
+                process_prepared_transactions(chunk, &target_programs, &stats, timing.as_ref());
+            buffer.extend(records);
+            while buffer.len() >= BATCH_SIZE {
+                let batch: Vec<_> = buffer.drain(..BATCH_SIZE).collect();
+                batch_tx
+                    .send(batch)
+                    .map_err(|_| anyhow!("failed to send parquet batch to writer thread"))?;
             }
         }
     }
 
-    flush_batch(&schema, &mut writer, &mut buffer)?;
-    writer.close().context("failed to finalize parquet file")?;
+    if !buffer.is_empty() {
+        let batch = std::mem::take(&mut buffer);
+        batch_tx
+            .send(batch)
+            .map_err(|_| anyhow!("failed to send final parquet batch to writer thread"))?;
+    }
+    drop(batch_tx); // signal completion
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))?;
+    writer_result?;
 
     let elapsed = start_time.elapsed();
-    progress_ui.finish();
-    eprintln!();
     print_final_summary(&stats, first_slot, last_slot, elapsed);
-    print_timing_summary(elapsed);
+    timing.print_summary();
 
     Ok(())
+}
+
+async fn process_network_stream(
+    url: &str,
+    output_path: PathBuf,
+    target_programs: Arc<HashSet<Pubkey>>,
+) -> anyhow::Result<()> {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(6 * 60 * 60))
+        .build()
+        .context("failed to build http client")?;
+    let response = client.get(url).send().await.context("http request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("http request failed with status {status} for {url}"));
+    }
+
+    let stream = response.bytes_stream().map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+    let reader = StreamReader::new(stream);
+    process_stream(
+        Box::new(reader),
+        output_path,
+        target_programs,
+    )
+    .await
 }
 
 enum DecodedData<B, P> {
@@ -340,13 +415,6 @@ where
             .map(DecodedData::Bincode)
             .with_context(|| format!("failed to decode {kind} with protobuf/bincode")),
     }
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct StoredBlockReward {
-    pubkey: String,
-    lamports: i64,
 }
 
 #[derive(Serialize)]
@@ -388,12 +456,30 @@ struct TokenBalanceDelta {
     post_ui_amount: Option<String>,
 }
 
+trait OwnerString {
+    fn owner_string(&self) -> Cow<'_, str>;
+}
+
+impl OwnerString for String {
+    fn owner_string(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.as_str())
+    }
+}
+
+impl OwnerString for Option<String> {
+    fn owner_string(&self) -> Cow<'_, str> {
+        match self.as_deref() {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Borrowed(""),
+        }
+    }
+}
+
 struct Stats {
     total_transactions: AtomicU64,
     matching_transactions: AtomicU64,
     total_blocks: AtomicU64,
-    skipped_metadata_errors: AtomicU64,
-    skipped_no_program: AtomicU64,
+    metadata_errors: AtomicU64,
 }
 
 impl Default for Stats {
@@ -402,246 +488,110 @@ impl Default for Stats {
             total_transactions: AtomicU64::new(0),
             matching_transactions: AtomicU64::new(0),
             total_blocks: AtomicU64::new(0),
-            skipped_metadata_errors: AtomicU64::new(0),
-            skipped_no_program: AtomicU64::new(0),
+            metadata_errors: AtomicU64::new(0),
         }
     }
+}
+
+fn print_progress(stats: &Stats, last_slot: Option<u64>, start_time: Instant) {
+    let total = stats.total_transactions.load(Ordering::Relaxed);
+    let matched = stats.matching_transactions.load(Ordering::Relaxed);
+    let blocks = stats.total_blocks.load(Ordering::Relaxed);
+    let metadata_errors = stats.metadata_errors.load(Ordering::Relaxed);
+    let slot = last_slot.unwrap_or(0);
+    let elapsed = start_time.elapsed();
+    let speed = if elapsed.as_secs_f64() > 0.0 {
+        (total as f64 / elapsed.as_secs_f64()) as u64
+    } else {
+        0
+    };
+
+    eprintln!(
+        "[progress] total={} matched={} blocks={} slot={} speed={} tx/s metadata_errors={}",
+        format_number(total),
+        format_number(matched),
+        format_number(blocks),
+        format_number(slot),
+        format_number(speed),
+        format_number(metadata_errors)
+    );
 }
 
 struct PreparedTx {
     slot: u64,
     block_time: Option<i64>,
-    tx_data: Vec<u8>,
-    meta_data: Option<Vec<u8>>,
+    tx_data: Bytes,
+    meta_data: Option<Bytes>,
 }
 
-struct StatsProgress {
-    _multi: MultiProgress,
-    pb_total: ProgressBar,
-    pb_matched: ProgressBar,
-    pb_skipped_meta: ProgressBar,
-    pb_skipped_no_prog: ProgressBar,
-    pb_blocks: ProgressBar,
-    pb_slot: ProgressBar,
-    pb_speed: ProgressBar,
-    pb_elapsed: ProgressBar,
-}
-
-impl StatsProgress {
-    fn new() -> Self {
-        let multi = MultiProgress::new();
-        let pb_total = Self::make_bar(&multi);
-        let pb_matched = Self::make_bar(&multi);
-        let pb_skipped_meta = Self::make_bar(&multi);
-        let pb_skipped_no_prog = Self::make_bar(&multi);
-        let pb_blocks = Self::make_bar(&multi);
-        let pb_slot = Self::make_bar(&multi);
-        let pb_speed = Self::make_bar(&multi);
-        let pb_elapsed = Self::make_bar(&multi);
-        Self {
-            _multi: multi,
-            pb_total,
-            pb_matched,
-            pb_skipped_meta,
-            pb_skipped_no_prog,
-            pb_blocks,
-            pb_slot,
-            pb_speed,
-            pb_elapsed,
-        }
-    }
-
-    fn make_bar(multi: &MultiProgress) -> ProgressBar {
-        let pb = multi.add(ProgressBar::new_spinner());
-        pb.set_style(
-            ProgressStyle::with_template("{msg}").expect("progress template must be valid"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(250));
-        pb
-    }
-
-    fn update(&self, stats: &Stats, last_slot: Option<u64>, start_time: Instant) {
-        let total = stats.total_transactions.load(Ordering::Relaxed);
-        let matched = stats.matching_transactions.load(Ordering::Relaxed);
-        let skipped_meta = stats.skipped_metadata_errors.load(Ordering::Relaxed);
-        let skipped_no_prog = stats.skipped_no_program.load(Ordering::Relaxed);
-        let blocks = stats.total_blocks.load(Ordering::Relaxed);
-        let slot = last_slot.unwrap_or(0);
-        let elapsed = start_time.elapsed();
-        let elapsed_str = format_duration(elapsed);
-        let speed = if elapsed.as_secs_f64() > 0.0 {
-            (total as f64 / elapsed.as_secs_f64()) as u64
-        } else {
-            0
-        };
-
-        self.pb_total
-            .set_message(format!("total tx:         {}", format_number(total)));
-        self.pb_matched
-            .set_message(format!("matched tx:       {}", format_number(matched)));
-        self.pb_skipped_meta
-            .set_message(format!("skipped bad_meta: {}", format_number(skipped_meta)));
-        self.pb_skipped_no_prog.set_message(format!(
-            "skipped no_prog:  {}",
-            format_number(skipped_no_prog)
-        ));
-        self.pb_blocks
-            .set_message(format!("blocks:           {}", format_number(blocks)));
-        self.pb_slot
-            .set_message(format!("slot:             {}", format_number(slot)));
-        self.pb_speed
-            .set_message(format!("speed:            {} tx/s", format_number(speed)));
-        self.pb_elapsed
-            .set_message(format!("elapsed:          {}", elapsed_str));
-    }
-
-    fn finish(&self) {
-        self.pb_total.finish_and_clear();
-        self.pb_matched.finish_and_clear();
-        self.pb_skipped_meta.finish_and_clear();
-        self.pb_skipped_no_prog.finish_and_clear();
-        self.pb_blocks.finish_and_clear();
-        self.pb_slot.finish_and_clear();
-        self.pb_speed.finish_and_clear();
-        self.pb_elapsed.finish_and_clear();
-    }
-}
-
-#[allow(dead_code)]
-enum TimingPhase {
-    ReadNodes,
-    PrepareTxs,
-    TxDecode,
-    MetaDecompress,
-    MetaDecode,
-    ExtendAccountKeys,
-    HasProgramCheck,
-    BuildDeltas,
-    JsonSerialize,
-}
-
-#[cfg(feature = "timing")]
+#[derive(Default)]
 struct TimingStats {
-    read_nodes: AtomicU64,
-    prepare_txs: AtomicU64,
-    tx_decode: AtomicU64,
-    meta_decompress: AtomicU64,
-    meta_decode: AtomicU64,
-    extend_account_keys: AtomicU64,
-    has_program_check: AtomicU64,
-    build_deltas: AtomicU64,
-    json_serialize: AtomicU64,
+    sample_counter: AtomicU64,
+    tx_decode_ns: AtomicU64,
+    tx_decode_samples: AtomicU64,
+    meta_decode_ns: AtomicU64,
+    meta_decode_samples: AtomicU64,
+    match_check_ns: AtomicU64,
+    match_check_samples: AtomicU64,
+    build_record_ns: AtomicU64,
+    build_record_samples: AtomicU64,
+    parquet_write_ns: AtomicU64,
+    parquet_write_samples: AtomicU64,
 }
 
-#[cfg(feature = "timing")]
 impl TimingStats {
-    const fn new() -> Self {
-        Self {
-            read_nodes: AtomicU64::new(0),
-            prepare_txs: AtomicU64::new(0),
-            tx_decode: AtomicU64::new(0),
-            meta_decompress: AtomicU64::new(0),
-            meta_decode: AtomicU64::new(0),
-            extend_account_keys: AtomicU64::new(0),
-            has_program_check: AtomicU64::new(0),
-            build_deltas: AtomicU64::new(0),
-            json_serialize: AtomicU64::new(0),
+    fn should_sample(&self) -> bool {
+        self.sample_counter.fetch_add(1, Ordering::Relaxed) % TIMING_SAMPLE_RATE == 0
+    }
+
+    fn record(&self, total_ns: &AtomicU64, samples: &AtomicU64, duration: std::time::Duration, do_sample: bool) {
+        if do_sample {
+            let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+            total_ns.fetch_add(nanos, Ordering::Relaxed);
+            samples.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn add(&self, phase: TimingPhase, duration: Duration) {
-        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
-        let atomic = match phase {
-            TimingPhase::ReadNodes => &self.read_nodes,
-            TimingPhase::PrepareTxs => &self.prepare_txs,
-            TimingPhase::TxDecode => &self.tx_decode,
-            TimingPhase::MetaDecompress => &self.meta_decompress,
-            TimingPhase::MetaDecode => &self.meta_decode,
-            TimingPhase::ExtendAccountKeys => &self.extend_account_keys,
-            TimingPhase::HasProgramCheck => &self.has_program_check,
-            TimingPhase::BuildDeltas => &self.build_deltas,
-            TimingPhase::JsonSerialize => &self.json_serialize,
-        };
-        atomic.fetch_add(nanos, Ordering::Relaxed);
-    }
-
-    fn get(&self, phase: TimingPhase) -> Duration {
-        let nanos = match phase {
-            TimingPhase::ReadNodes => self.read_nodes.load(Ordering::Relaxed),
-            TimingPhase::PrepareTxs => self.prepare_txs.load(Ordering::Relaxed),
-            TimingPhase::TxDecode => self.tx_decode.load(Ordering::Relaxed),
-            TimingPhase::MetaDecompress => self.meta_decompress.load(Ordering::Relaxed),
-            TimingPhase::MetaDecode => self.meta_decode.load(Ordering::Relaxed),
-            TimingPhase::ExtendAccountKeys => self.extend_account_keys.load(Ordering::Relaxed),
-            TimingPhase::HasProgramCheck => self.has_program_check.load(Ordering::Relaxed),
-            TimingPhase::BuildDeltas => self.build_deltas.load(Ordering::Relaxed),
-            TimingPhase::JsonSerialize => self.json_serialize.load(Ordering::Relaxed),
-        };
-        Duration::from_nanos(nanos)
-    }
-}
-
-#[cfg(feature = "timing")]
-static TIMING: TimingStats = TimingStats::new();
-
-#[cfg(feature = "timing")]
-fn timing_add(phase: TimingPhase, duration: Duration) {
-    TIMING.add(phase, duration);
-}
-
-#[cfg(feature = "timing")]
-fn print_timing_summary(total_elapsed: Duration) {
-    fn percent(part: Duration, total: Duration) -> f64 {
-        if total.as_nanos() == 0 {
-            0.0
-        } else {
-            part.as_secs_f64() / total.as_secs_f64() * 100.0
+    fn print_summary(&self) {
+        let stages = [
+            ("tx_decode", &self.tx_decode_ns, &self.tx_decode_samples),
+            ("meta_decode", &self.meta_decode_ns, &self.meta_decode_samples),
+            ("match_check", &self.match_check_ns, &self.match_check_samples),
+            ("build_record", &self.build_record_ns, &self.build_record_samples),
+            ("parquet_write", &self.parquet_write_ns, &self.parquet_write_samples),
+        ];
+        eprintln!("[timing]");
+        for (label, total, count) in stages {
+            let c = count.load(Ordering::Relaxed);
+            let ns = total.load(Ordering::Relaxed);
+            if c == 0 {
+                eprintln!("  {:<14} total={:>10.3} ms avg={:>8} samples=0", label, 0.0, "n/a");
+            } else {
+                let avg_ns = ns / c;
+                let ms = ns as f64 / 1_000_000.0;
+                eprintln!(
+                    "  {:<14} total={:>10.3} ms avg={:>8.3} µs samples={}",
+                    label,
+                    ms,
+                    avg_ns as f64 / 1_000.0,
+                    c
+                );
+            }
         }
     }
-
-    let phases = [
-        (TimingPhase::ReadNodes, "phase_A_read_nodes"),
-        (TimingPhase::PrepareTxs, "phase_B_prepare_txs"),
-        (TimingPhase::TxDecode, "phase_C_tx_decode"),
-        (TimingPhase::MetaDecompress, "phase_C_meta_decompress"),
-        (TimingPhase::MetaDecode, "phase_C_meta_decode"),
-        (
-            TimingPhase::ExtendAccountKeys,
-            "phase_C_extend_account_keys",
-        ),
-        (TimingPhase::HasProgramCheck, "phase_C_has_program_check"),
-        (TimingPhase::BuildDeltas, "phase_C_build_deltas"),
-        (
-            TimingPhase::JsonSerialize,
-            "phase_C_json_serialize_and_print",
-        ),
-    ];
-
-    eprintln!("[timing]");
-    eprintln!("  total_elapsed:        {}", format_duration(total_elapsed));
-    for (phase, label) in phases {
-        let duration = TIMING.get(phase);
-        eprintln!(
-            "  {label:<24} {:>8.3} s ({:>5.1}%)",
-            duration.as_secs_f64(),
-            percent(duration, total_elapsed)
-        );
-    }
 }
-
-#[cfg(not(feature = "timing"))]
-fn print_timing_summary(_: Duration) {}
 
 fn process_prepared_transactions(
     prepared: Vec<PreparedTx>,
     target_programs: &HashSet<Pubkey>,
     stats: &Stats,
+    timing: &TimingStats,
 ) -> Vec<WhalesV1Record> {
     prepared
         .into_par_iter()
         .filter_map(|tx| {
             let slot = tx.slot;
-            match process_prepared_tx(tx, target_programs, stats) {
+            match process_prepared_tx(tx, target_programs, stats, timing) {
                 Ok(Some(record)) => {
                     stats.matching_transactions.fetch_add(1, Ordering::Relaxed);
                     Some(record)
@@ -660,109 +610,114 @@ fn process_prepared_tx(
     prepared: PreparedTx,
     target_programs: &HashSet<Pubkey>,
     stats: &Stats,
+    timing: &TimingStats,
 ) -> anyhow::Result<Option<WhalesV1Record>> {
-    #[cfg(feature = "timing")]
+    let sample = timing.should_sample();
     let tx_decode_start = Instant::now();
     let tx: VersionedTransaction =
-        bincode::deserialize(&prepared.tx_data).context("failed to parse tx")?;
-    #[cfg(feature = "timing")]
-    timing_add(TimingPhase::TxDecode, tx_decode_start.elapsed());
+        bincode::deserialize(prepared.tx_data.as_ref()).context("failed to parse tx")?;
+    timing.record(
+        &timing.tx_decode_ns,
+        &timing.tx_decode_samples,
+        tx_decode_start.elapsed(),
+        sample,
+    );
 
     let (account_keys, instructions) = match &tx.message {
         VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
         VersionedMessage::V0(msg) => (&msg.account_keys, &msg.instructions),
     };
 
-    #[cfg(feature = "timing")]
-    let program_check_start = Instant::now();
-    let involves_program = account_keys.iter().any(|key| target_programs.contains(key));
-    #[cfg(feature = "timing")]
-    timing_add(TimingPhase::HasProgramCheck, program_check_start.elapsed());
-    if !involves_program {
-        stats.skipped_no_program.fetch_add(1, Ordering::Relaxed);
-        return Ok(None);
-    }
+    let match_check_start = Instant::now();
+    let outer_match = matches_outer(target_programs, account_keys, instructions);
 
     let mut meta: Option<TransactionStatusMeta> = None;
-    if let Some(meta_data) = prepared.meta_data {
-        if !meta_data.is_empty() {
-            #[cfg(feature = "timing")]
-            let meta_decompress_start = Instant::now();
-            let buffer = match zstd::decode_all(meta_data.as_slice()) {
-                Ok(buffer) => buffer,
-                Err(err) => {
-                    #[cfg(feature = "timing")]
-                    timing_add(TimingPhase::MetaDecompress, meta_decompress_start.elapsed());
-                    eprintln!(
-                        "[warn] failed to decompress tx metadata at slot {}: {err}",
-                        prepared.slot
-                    );
-                    stats
-                        .skipped_metadata_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
-                }
-            };
-            #[cfg(feature = "timing")]
-            timing_add(TimingPhase::MetaDecompress, meta_decompress_start.elapsed());
-            #[cfg(feature = "timing")]
+    if !outer_match {
+        let Some(meta_bytes) = prepared.meta_data.as_ref() else {
+            return Ok(None);
+        };
+        if !meta_bytes.is_empty() {
             let meta_decode_start = Instant::now();
-            match decode_transaction_status_meta(&buffer) {
-                Ok(decoded) => {
-                    #[cfg(feature = "timing")]
-                    timing_add(TimingPhase::MetaDecode, meta_decode_start.elapsed());
-                    meta = Some(decoded);
-                }
-                Err(err) => {
-                    #[cfg(feature = "timing")]
-                    timing_add(TimingPhase::MetaDecode, meta_decode_start.elapsed());
-                    eprintln!(
-                        "[warn] failed to decode tx metadata at slot {}: {err}",
-                        prepared.slot
-                    );
-                    stats
-                        .skipped_metadata_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
+            match try_decode_meta(meta_bytes.as_ref(), prepared.slot, stats) {
+                Ok(Some(decoded)) => meta = Some(decoded),
+                Ok(None) => {}
+                Err(_) => return Ok(None),
+            }
+            timing.record(
+                &timing.meta_decode_ns,
+                &timing.meta_decode_samples,
+                meta_decode_start.elapsed(),
+                sample,
+            );
+        }
+    } else if let Some(meta_bytes) = prepared.meta_data.as_ref() {
+        if !meta_bytes.is_empty() {
+            let meta_decode_start = Instant::now();
+            match try_decode_meta(meta_bytes.as_ref(), prepared.slot, stats) {
+                Ok(Some(decoded)) => meta = Some(decoded),
+                Ok(None) => {}
+                Err(_) => {
+                    // keep meta = None; outer match must still emit a record
                 }
             }
+            timing.record(
+                &timing.meta_decode_ns,
+                &timing.meta_decode_samples,
+                meta_decode_start.elapsed(),
+                sample,
+            );
         }
     }
 
-    #[cfg(feature = "timing")]
-    let extend_keys_start = Instant::now();
     let mut full_account_keys: Vec<Pubkey> = account_keys.clone();
     if let (VersionedMessage::V0(_), Some(meta)) = (&tx.message, meta.as_ref()) {
         full_account_keys.extend(meta.loaded_addresses.writable.iter().cloned());
         full_account_keys.extend(meta.loaded_addresses.readonly.iter().cloned());
     }
-    #[cfg(feature = "timing")]
-    timing_add(TimingPhase::ExtendAccountKeys, extend_keys_start.elapsed());
 
     let inner_instruction_sets = meta
         .as_ref()
         .and_then(|meta| meta.inner_instructions.as_ref());
 
-    let mut program_ids = BTreeSet::new();
+    let match_result = if outer_match {
+        true
+    } else {
+        matches_inner(target_programs, &full_account_keys, inner_instruction_sets)
+    };
+    timing.record(
+        &timing.match_check_ns,
+        &timing.match_check_samples,
+        match_check_start.elapsed(),
+        sample,
+    );
+    if !match_result {
+        return Ok(None);
+    }
+
+    let mut program_ids: Vec<Pubkey> = Vec::new();
     for ix in instructions {
-        program_ids.insert(resolve_program_id(&full_account_keys, ix.program_id_index));
+        if let Some(key) = resolve_program_key(&full_account_keys, ix.program_id_index) {
+            program_ids.push(key);
+        }
     }
     if let Some(inner_sets) = inner_instruction_sets {
         for inner in inner_sets {
             for ix in &inner.instructions {
-                program_ids.insert(resolve_program_id(
-                    &full_account_keys,
-                    ix.instruction.program_id_index,
-                ));
+                if let Some(key) =
+                    resolve_program_key(&full_account_keys, ix.instruction.program_id_index)
+                {
+                    program_ids.push(key);
+                }
             }
         }
     }
+    program_ids.sort_unstable();
+    program_ids.dedup();
 
+    let build_start = Instant::now();
     let parsed_instructions =
         build_parsed_instructions(&full_account_keys, instructions, inner_instruction_sets);
 
-    #[cfg(feature = "timing")]
-    let build_deltas_start = Instant::now();
     let account_balance_deltas = meta
         .as_ref()
         .map(|meta| build_account_balance_deltas(meta, &full_account_keys))
@@ -771,8 +726,6 @@ fn process_prepared_tx(
         .as_ref()
         .map(build_token_balance_deltas)
         .unwrap_or_default();
-    #[cfg(feature = "timing")]
-    timing_add(TimingPhase::BuildDeltas, build_deltas_start.elapsed());
     let fee = meta.as_ref().map(|meta| meta.fee).unwrap_or_default();
     let record = WhalesV1Record {
         slot: prepared.slot,
@@ -782,7 +735,7 @@ fn process_prepared_tx(
             .iter()
             .map(|key| key.to_string())
             .collect(),
-        program_ids: program_ids.into_iter().collect(),
+        program_ids: program_ids.into_iter().map(|key| key.to_string()).collect(),
         fee,
         account_balance_deltas,
         token_balance_deltas,
@@ -794,10 +747,12 @@ fn process_prepared_tx(
             .and_then(|meta| meta.status.as_ref().err().map(|e| format!("{e:?}"))),
         instructions: parsed_instructions,
     };
-    #[cfg(feature = "timing")]
-    let json_start = Instant::now();
-    #[cfg(feature = "timing")]
-    timing_add(TimingPhase::JsonSerialize, json_start.elapsed());
+    timing.record(
+        &timing.build_record_ns,
+        &timing.build_record_samples,
+        build_start.elapsed(),
+        sample,
+    );
 
     Ok(Some(record))
 }
@@ -813,11 +768,81 @@ fn decode_transaction_status_meta(buffer: &[u8]) -> anyhow::Result<TransactionSt
     }
 }
 
-fn resolve_program_id(account_keys: &[Pubkey], program_id_index: u8) -> String {
+fn try_decode_meta(
+    meta_data: &[u8],
+    slot: u64,
+    stats: &Stats,
+) -> anyhow::Result<Option<TransactionStatusMeta>> {
+    let buffer = zstd::decode_all(meta_data);
+    let buffer = match buffer {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            eprintln!("[warn] failed to decompress tx metadata at slot {}: {err}", slot);
+            stats.metadata_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(anyhow!("metadata decompress failed"));
+        }
+    };
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+    match decode_transaction_status_meta(&buffer) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(err) => {
+            eprintln!("[warn] failed to decode tx metadata at slot {}: {err}", slot);
+            stats.metadata_errors.fetch_add(1, Ordering::Relaxed);
+            Err(err)
+        }
+    }
+}
+
+fn program_matches(
+    program_id_index: u8,
+    account_keys: &[Pubkey],
+    target_programs: &HashSet<Pubkey>,
+) -> bool {
     account_keys
         .get(program_id_index as usize)
+        .map_or(false, |key| target_programs.contains(key))
+}
+
+fn matches_outer(
+    target_programs: &HashSet<Pubkey>,
+    account_keys: &[Pubkey],
+    instructions: &[CompiledInstruction],
+) -> bool {
+    instructions
+        .iter()
+        .any(|ix| program_matches(ix.program_id_index, account_keys, target_programs))
+}
+
+fn matches_inner(
+    target_programs: &HashSet<Pubkey>,
+    account_keys: &[Pubkey],
+    inner_instruction_sets: Option<&Vec<solana_transaction_status::InnerInstructions>>,
+) -> bool {
+    let Some(inner_sets) = inner_instruction_sets else {
+        return false;
+    };
+    for inner in inner_sets {
+        for ix in &inner.instructions {
+            if program_matches(ix.instruction.program_id_index, account_keys, target_programs) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn resolve_program_id(account_keys: &[Pubkey], program_id_index: u8) -> String {
+    resolve_program_key(account_keys, program_id_index)
         .map(|key| key.to_string())
         .unwrap_or_else(|| format!("UNKNOWN_PROGRAM_INDEX_{program_id_index}"))
+}
+
+fn resolve_program_key(account_keys: &[Pubkey], program_id_index: u8) -> Option<Pubkey> {
+    account_keys
+        .get(program_id_index as usize)
+        .copied()
 }
 
 fn build_parsed_instructions(
@@ -875,6 +900,11 @@ fn build_account_balance_deltas(
 }
 
 fn build_token_balance_deltas(meta: &TransactionStatusMeta) -> Vec<TokenBalanceDelta> {
+    fn owner_string(balance: &TransactionTokenBalance) -> Cow<'_, str> {
+        // Handles both String and Option<String> across crate versions
+        balance.owner.owner_string()
+    }
+
     fn apply_balances<'a>(
         map: &mut BTreeMap<(String, String, u8), TokenBalanceDelta>,
         balances: impl Iterator<Item = &'a TransactionTokenBalance>,
@@ -883,7 +913,7 @@ fn build_token_balance_deltas(meta: &TransactionStatusMeta) -> Vec<TokenBalanceD
         for balance in balances {
             let key = (
                 balance.mint.clone(),
-                balance.owner.clone(),
+                owner_string(balance).into_owned(),
                 balance.account_index,
             );
             let entry = map.entry(key.clone()).or_insert_with(|| TokenBalanceDelta {
@@ -920,8 +950,7 @@ fn print_final_summary(
 ) {
     let total = stats.total_transactions.load(Ordering::Relaxed);
     let matched = stats.matching_transactions.load(Ordering::Relaxed);
-    let skipped_meta = stats.skipped_metadata_errors.load(Ordering::Relaxed);
-    let skipped_no_program = stats.skipped_no_program.load(Ordering::Relaxed);
+    let metadata_errors = stats.metadata_errors.load(Ordering::Relaxed);
     let blocks = stats.total_blocks.load(Ordering::Relaxed);
     let speed = if elapsed.as_secs_f64() > 0.0 {
         (total as f64 / elapsed.as_secs_f64()) as u64
@@ -933,11 +962,7 @@ fn print_final_summary(
     eprintln!("[done]");
     eprintln!("  total tx:            {}", format_number(total));
     eprintln!("  matched tx:          {}", format_number(matched));
-    eprintln!("  skipped (bad meta):  {}", format_number(skipped_meta));
-    eprintln!(
-        "  skipped (no program):{}",
-        format_number(skipped_no_program)
-    );
+    eprintln!("  metadata errors:     {}", format_number(metadata_errors));
     eprintln!("  blocks:              {}", format_number(blocks));
     if let Some(slot) = first_slot {
         eprintln!("  first slot:          {}", slot);
@@ -1038,21 +1063,23 @@ fn build_schema() -> SchemaRef {
     ]))
 }
 
-fn flush_batch(
+fn flush_batch_sync(
     schema: &SchemaRef,
     writer: &mut ArrowWriter<std::fs::File>,
-    buffer: &mut Vec<WhalesV1Record>,
+    records: Vec<WhalesV1Record>,
 ) -> anyhow::Result<()> {
-    if buffer.is_empty() {
+    if records.is_empty() {
         return Ok(());
     }
 
-    let mut slot_builder = UInt64Builder::new();
-    let mut block_time_builder = Int64Builder::new();
-    let mut signatures_builder = ListBuilder::new(StringBuilder::new());
-    let mut accounts_builder = ListBuilder::new(StringBuilder::new());
-    let mut program_ids_builder = ListBuilder::new(StringBuilder::new());
-    let mut fee_builder = UInt64Builder::new();
+    let rows = records.len();
+
+    let mut slot_builder = UInt64Builder::with_capacity(rows);
+    let mut block_time_builder = Int64Builder::with_capacity(rows);
+    let mut signatures_builder = ListBuilder::with_capacity(StringBuilder::new(), rows);
+    let mut accounts_builder = ListBuilder::with_capacity(StringBuilder::new(), rows);
+    let mut program_ids_builder = ListBuilder::with_capacity(StringBuilder::new(), rows);
+    let mut fee_builder = UInt64Builder::with_capacity(rows);
 
     let account_balance_struct_builder = StructBuilder::new(
         vec![
@@ -1068,7 +1095,8 @@ fn flush_batch(
             Box::new(Int64Builder::new()),
         ],
     );
-    let mut account_balance_builder = ListBuilder::new(account_balance_struct_builder);
+    let mut account_balance_builder =
+        ListBuilder::with_capacity(account_balance_struct_builder, rows);
 
     let token_balance_struct_builder = StructBuilder::new(
         vec![
@@ -1086,7 +1114,7 @@ fn flush_batch(
             Box::new(StringBuilder::new()),
         ],
     );
-    let mut token_balance_builder = ListBuilder::new(token_balance_struct_builder);
+    let mut token_balance_builder = ListBuilder::with_capacity(token_balance_struct_builder, rows);
 
     let instruction_struct_builder = StructBuilder::new(
         vec![
@@ -1104,12 +1132,12 @@ fn flush_batch(
             Box::new(ListBuilder::new(StringBuilder::new())),
         ],
     );
-    let mut instructions_builder = ListBuilder::new(instruction_struct_builder);
+    let mut instructions_builder = ListBuilder::with_capacity(instruction_struct_builder, rows);
 
-    let mut log_messages_builder = ListBuilder::new(StringBuilder::new());
-    let mut err_builder = StringBuilder::new();
+    let mut log_messages_builder = ListBuilder::with_capacity(StringBuilder::new(), rows);
+    let mut err_builder = StringBuilder::with_capacity(rows, rows.saturating_mul(16));
 
-    for record in buffer.iter() {
+    for record in records.iter() {
         slot_builder.append_value(record.slot);
         match record.block_time {
             Some(v) => block_time_builder.append_value(v),
@@ -1257,6 +1285,5 @@ fn flush_batch(
         .write(&batch)
         .context("failed to write parquet batch")?;
 
-    buffer.clear();
     Ok(())
 }

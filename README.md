@@ -1,6 +1,6 @@
 # Solana Data Extractor
 
-Solana Data Extractor is a blazingly fast, multi-threaded Rust tool for pulling specific Solana transactions out of raw ledger history (CAR archives from Old Faithful) and writing them to Parquet for analysis in DuckDB/Pandas. It replaces the older Python-based pipeline with a SIMD-accelerated byte filter (Aho-Corasick) and structured Arrow/Parquet output that includes logs and parsed instructions.
+A minimal, async Rust extractor for pulling Solana transactions from Old Faithful CAR archives (file or HTTP stream) and writing per-epoch Parquet outputs ready for DuckDB/Pandas. The pipeline is single-path: ingest → parse nodes → decode transactions/metadata → exact program-invocation filter → Parquet.
 
 ## Prerequisites
 
@@ -15,15 +15,22 @@ cargo build --release --bin solana_extractor
 
 ## Usage
 
-Key arguments:
+CLI flags (final form):
 
-- `--program`: Comma-separated list of Program IDs to filter.
-- `--num-epochs`: How many epochs back to process.
-- `--latest-epoch`: Starting epoch (default `881`).
-- `-j, --concurrency`: Parallel downloads/workers (default `4`).
-- `--data-dir`: Directory for CAR downloads and Parquet output.
+- `--latest-epoch <u64>`: Starting epoch (default `881`).
+- `--num-epochs <u64>`: How many epochs back to process (default `5`).
+- `--data-dir <path>`: Directory for Parquet outputs (and local CAR files when not streaming; default `./data`).
+- `--program <comma-separated pubkeys>`: Target program IDs (default: pump.fun).
+- `--stream-download`: Stream CARs directly over HTTPS without saving to disk.
+- `--keep-car`: When downloading CARs to disk, keep them after processing (default deletes).
 
-The tool downloads missing CAR files via `aria2c`, filters transactions using Aho-Corasick against the target Program IDs (including CPI presence via account keys), and writes Parquet batches with detailed schema (signatures, block_time, fee, logs, program IDs, parsed instructions with base58 data and resolved accounts, token/account balance deltas, errors).
+Behavior:
+
+- Local mode (default): If `epoch-{n}.car` is missing, it is downloaded via `aria2c` into `--data-dir`, processed, then deleted unless `--keep-car` is set.
+- Streaming mode (`--stream-download`): Streams `https://files.old-faithful.net/{epoch}/epoch-{epoch}.car` directly into the pipeline (no local CAR files).
+- Transactions are decoded from bincode; metadata is decompressed/decoded when present. Metadata failures do not drop the transaction—optional fields are left empty.
+- Filtering keeps only transactions that invoke any target program (top-level or inner instructions), handling v0 loaded addresses for CPI program resolution.
+- Parquet is written per epoch with ZSTD compression and batched writes.
 
 ## Examples
 
@@ -39,18 +46,29 @@ cargo run --release --bin solana_extractor -- \
 
 ```bash
 cargo run --release --bin solana_extractor -- \
-  --program "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P,675kCCbvrYniyDAzEq89v34PqPP8j9S62279pX2t" \
-  -j 8
+  --program "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P,675kCCbvrYniyDAzEq89v34PqPP8j9S62279pX2t"
 ```
 
-### 3) Deep history (1000 epochs, high concurrency)
+### 3) Deep history (1000 epochs)
 
 ```bash
 cargo run --release --bin solana_extractor -- \
   --program "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" \
   --num-epochs 1000 \
   --latest-epoch 881 \
-  -j 16 \
+  --data-dir ./data
+```
+
+### 4) Native HTTP streaming (no local CAR, no curl)
+
+Sequentially stream CARs over HTTPS and write Parquet per epoch:
+
+```bash
+cargo run --release --bin solana_extractor -- \
+  --stream-download \
+  --program "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" \
+  --latest-epoch 894 \
+  --num-epochs 10 \
   --data-dir ./data
 ```
 
