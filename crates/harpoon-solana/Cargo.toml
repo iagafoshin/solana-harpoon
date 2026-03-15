@@ -1,0 +1,24 @@
+[package]
+name = "harpoon-solana"
+version = "0.1.0"
+description = "Solana transaction and metadata deserialization for harpoon"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bincode = "1.3.3"
+bs58 = "0.5"
+prost = "0.11.9"
+serde = { version = "1.0.219", features = ["derive"] }
+solana-sdk = "~2.2.2"
+solana-storage-proto = "~2.2.19"
+solana-transaction-status = "~2.2.19"
+thiserror = "2.0.11"
+zstd = "0.13.3"
+
+[dev-dependencies]
+solana-system-interface = "1.0.0"
+
+[lints]
+workspace = true
