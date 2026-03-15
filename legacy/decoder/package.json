@@ -1,0 +1,9 @@
+{
+  "name": "solana-idl-decoder",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "bs58": "^5.0.0"
+  }
+}
