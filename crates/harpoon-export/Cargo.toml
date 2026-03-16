@@ -1,0 +1,21 @@
+[package]
+name = "harpoon-export"
+version = "0.1.0"
+description = "Parquet / CSV / JSON Lines writer for Solana transaction records"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { version = "55", default-features = false, features = ["json"] }
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+arrow = { version = "55", default-features = false, features = ["json", "prettyprint"] }
+tempfile = "3"
+
+[lints]
+workspace = true

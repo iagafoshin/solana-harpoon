@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/harpoon-car", "crates/harpoon-solana", "crates/harpoon-decode"]
+members = ["crates/harpoon-car", "crates/harpoon-solana", "crates/harpoon-decode", "crates/harpoon-export"]
 
 [workspace.package]
 edition = "2024"
