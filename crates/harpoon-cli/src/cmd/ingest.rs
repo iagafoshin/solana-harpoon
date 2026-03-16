@@ -108,16 +108,18 @@ pub async fn run(
             let car_path = download::download_car(epoch, output_dir)?;
             eprintln!("Processing {car_path:?} → {output_path:?}");
 
-            // Run mmap pipeline on a blocking task to avoid starving tokio
-            let tp = Arc::clone(&target_programs);
-            let dec = idl_decoder.clone();
-            let cp = car_path.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                pipeline::run_mmap_pipeline(&cp, tp, dec, writer, batch_size, stats, timing)
-            })
-            .await
-            .context("pipeline task panicked")?;
-            result?;
+            let file = tokio::fs::File::open(&car_path).await?;
+            let reader = tokio::io::BufReader::new(file);
+            pipeline::run_async_pipeline(
+                Box::new(reader),
+                Arc::clone(&target_programs),
+                idl_decoder.clone(),
+                writer,
+                batch_size,
+                stats,
+                timing,
+            )
+            .await?;
 
             if !keep_car {
                 download::remove_car(&car_path)?;
