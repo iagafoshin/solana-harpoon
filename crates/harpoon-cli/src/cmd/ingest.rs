@@ -3,13 +3,13 @@
 use {
     crate::{
         download,
-        pipeline,
+        pipeline::{self, ExtractMode},
         stats::{PipelineStats, TimingStats},
     },
     anyhow::{anyhow, Context},
     futures_util::TryStreamExt,
     harpoon_decode::IdlDecoder,
-    harpoon_export::{OutputFormat, create_writer},
+    harpoon_export::{FlatPartitionedWriter, OutputFormat, create_writer},
     solana_sdk::pubkey::Pubkey,
     std::{
         collections::HashSet,
@@ -30,6 +30,7 @@ pub async fn run(
     stream_download: bool,
     keep_car: bool,
     batch_size: usize,
+    extract_mode: ExtractMode,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create output dir: {output_dir:?}"))?;
@@ -53,6 +54,17 @@ pub async fn run(
         .transpose()?
         .map(Arc::new);
 
+    // Build extract schemas from IDL (for events/instructions modes)
+    let extract_schemas = if extract_mode != ExtractMode::Raw {
+        let idl_json = std::fs::read_to_string(idl_path.unwrap())
+            .with_context(|| format!("failed to read IDL: {:?}", idl_path.unwrap()))?;
+        let idl: harpoon_decode::Idl = serde_json::from_str(&idl_json)
+            .context("failed to parse IDL JSON")?;
+        Some(pipeline::build_extract_schemas(&idl, extract_mode))
+    } else {
+        None
+    };
+
     let target_programs = Arc::new(target_programs);
     let ext = match format {
         OutputFormat::Parquet => "parquet",
@@ -61,72 +73,191 @@ pub async fn run(
     };
 
     eprintln!(
-        "Starting ingest for {} epoch(s), {} program(s), format={}",
+        "Starting ingest for {} epoch(s), {} program(s), format={}, extract={:?}",
         epochs.len(),
         target_programs.len(),
         ext,
+        extract_mode,
     );
 
     for &epoch in epochs {
-        let output_path = output_dir.join(format!("epoch-{epoch}.{ext}"));
         let stats = Arc::new(PipelineStats::default());
         let timing = Arc::new(TimingStats::default());
-        let writer = create_writer(&output_path, format, batch_size)?;
 
         eprintln!("--- Epoch {epoch} ---");
 
-        if stream_download {
-            let url = download::epoch_url(epoch);
-            eprintln!("Streaming from {url}");
+        match extract_mode {
+            ExtractMode::Raw => {
+                let output_path = output_dir.join(format!("epoch-{epoch}.{ext}"));
+                let writer = create_writer(&output_path, format, batch_size)?;
 
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(20))
-                .timeout(Duration::from_secs(6 * 60 * 60))
-                .build()
-                .context("http client")?;
-            let resp = client.get(&url).send().await.context("http request")?;
-            if !resp.status().is_success() {
-                return Err(anyhow!("HTTP {} for {url}", resp.status()));
+                run_pipeline_for_epoch(
+                    epoch,
+                    output_dir,
+                    stream_download,
+                    keep_car,
+                    &target_programs,
+                    &idl_decoder,
+                    writer,
+                    batch_size,
+                    stats,
+                    timing,
+                )
+                .await?;
             }
+            ExtractMode::Events | ExtractMode::Instructions => {
+                let schemas = extract_schemas.as_ref().unwrap().clone();
+                let output_subdir = output_dir.join(format!("epoch-{epoch}"));
+                let writer = FlatPartitionedWriter::new(&output_subdir, format, schemas)?;
+                let decoder = Arc::clone(idl_decoder.as_ref().unwrap());
 
-            let stream = resp
-                .bytes_stream()
-                .map_err(std::io::Error::other);
-            let reader = tokio_util::io::StreamReader::new(stream);
-
-            pipeline::run_async_pipeline(
-                Box::new(reader),
-                Arc::clone(&target_programs),
-                idl_decoder.clone(),
-                writer,
-                batch_size,
-                stats,
-                timing,
-            )
-            .await?;
-        } else {
-            let car_path = download::download_car(epoch, output_dir)?;
-            eprintln!("Processing {car_path:?} → {output_path:?}");
-
-            let file = tokio::fs::File::open(&car_path).await?;
-            let reader = tokio::io::BufReader::new(file);
-            pipeline::run_async_pipeline(
-                Box::new(reader),
-                Arc::clone(&target_programs),
-                idl_decoder.clone(),
-                writer,
-                batch_size,
-                stats,
-                timing,
-            )
-            .await?;
-
-            if !keep_car {
-                download::remove_car(&car_path)?;
+                run_extract_for_epoch(
+                    epoch,
+                    output_dir,
+                    stream_download,
+                    keep_car,
+                    &target_programs,
+                    decoder,
+                    extract_mode,
+                    writer,
+                    batch_size,
+                    stats,
+                    timing,
+                )
+                .await?;
             }
         }
     }
 
     eprintln!("All epochs complete.");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline_for_epoch(
+    epoch: u64,
+    output_dir: &Path,
+    stream_download: bool,
+    keep_car: bool,
+    target_programs: &Arc<HashSet<Pubkey>>,
+    idl_decoder: &Option<Arc<IdlDecoder>>,
+    writer: Box<dyn harpoon_export::ExportWriter + Send>,
+    batch_size: usize,
+    stats: Arc<PipelineStats>,
+    timing: Arc<TimingStats>,
+) -> anyhow::Result<()> {
+    if stream_download {
+        let url = download::epoch_url(epoch);
+        eprintln!("Streaming from {url}");
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(6 * 60 * 60))
+            .build()
+            .context("http client")?;
+        let resp = client.get(&url).send().await.context("http request")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HTTP {} for {url}", resp.status()));
+        }
+
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(stream);
+
+        pipeline::run_async_pipeline(
+            Box::new(reader),
+            Arc::clone(target_programs),
+            idl_decoder.clone(),
+            writer,
+            batch_size,
+            stats,
+            timing,
+        )
+        .await
+    } else {
+        let car_path = download::download_car(epoch, output_dir)?;
+
+        let file = tokio::fs::File::open(&car_path).await?;
+        let reader = tokio::io::BufReader::new(file);
+        pipeline::run_async_pipeline(
+            Box::new(reader),
+            Arc::clone(target_programs),
+            idl_decoder.clone(),
+            writer,
+            batch_size,
+            stats,
+            timing,
+        )
+        .await?;
+
+        if !keep_car {
+            download::remove_car(&car_path)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_extract_for_epoch(
+    epoch: u64,
+    output_dir: &Path,
+    stream_download: bool,
+    keep_car: bool,
+    target_programs: &Arc<HashSet<Pubkey>>,
+    idl_decoder: Arc<IdlDecoder>,
+    extract_mode: ExtractMode,
+    writer: FlatPartitionedWriter,
+    batch_size: usize,
+    stats: Arc<PipelineStats>,
+    timing: Arc<TimingStats>,
+) -> anyhow::Result<()> {
+    if stream_download {
+        let url = download::epoch_url(epoch);
+        eprintln!("Streaming from {url}");
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(6 * 60 * 60))
+            .build()
+            .context("http client")?;
+        let resp = client.get(&url).send().await.context("http request")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HTTP {} for {url}", resp.status()));
+        }
+
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(stream);
+
+        pipeline::run_extract_pipeline(
+            Box::new(reader),
+            Arc::clone(target_programs),
+            idl_decoder,
+            extract_mode,
+            writer,
+            batch_size,
+            stats,
+            timing,
+        )
+        .await
+    } else {
+        let car_path = download::download_car(epoch, output_dir)?;
+
+        let file = tokio::fs::File::open(&car_path).await?;
+        let reader = tokio::io::BufReader::new(file);
+        pipeline::run_extract_pipeline(
+            Box::new(reader),
+            Arc::clone(target_programs),
+            idl_decoder,
+            extract_mode,
+            writer,
+            batch_size,
+            stats,
+            timing,
+        )
+        .await?;
+
+        if !keep_car {
+            download::remove_car(&car_path)?;
+        }
+        Ok(())
+    }
 }

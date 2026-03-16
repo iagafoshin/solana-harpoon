@@ -3,11 +3,14 @@ pub mod schema;
 pub mod writer;
 
 pub use {
-    record::{AccountBalanceDelta, InstructionRecord, TokenBalanceDelta, TransactionRecord},
-    schema::{build_schema, records_to_batch},
+    arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, SchemaRef as ArrowSchemaRef},
+    record::{
+        AccountBalanceDelta, FlatRecord, InstructionRecord, TokenBalanceDelta, TransactionRecord,
+    },
+    schema::{build_flat_schema, build_schema, flat_records_to_batch, records_to_batch},
     writer::{
-        create_writer, CsvExportWriter, ExportWriter, JsonLinesExportWriter, OutputFormat,
-        ParquetExportWriter, PartitionedWriter,
+        create_writer, CsvExportWriter, ExportWriter, FlatPartitionedWriter,
+        JsonLinesExportWriter, OutputFormat, ParquetExportWriter, PartitionedWriter,
     },
 };
 

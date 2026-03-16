@@ -47,3 +47,18 @@ pub struct InstructionRecord {
     pub data: String,
     pub accounts: Vec<String>,
 }
+
+/// A flat decoded record for events or instructions.
+///
+/// Common fields are typed; decoded payload fields are stored
+/// in a `serde_json::Map` and serialized flat via `#[serde(flatten)]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlatRecord {
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub signature: String,
+    pub name: String,
+    pub program_id: String,
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}

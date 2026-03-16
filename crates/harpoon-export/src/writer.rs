@@ -6,8 +6,8 @@
 
 use {
     crate::{
-        record::TransactionRecord,
-        schema::{build_schema, records_to_batch},
+        record::{FlatRecord, TransactionRecord},
+        schema::{build_schema, flat_records_to_batch, records_to_batch},
         Error,
     },
     arrow::datatypes::SchemaRef,
@@ -321,5 +321,115 @@ pub fn create_writer(path: &Path, format: OutputFormat, batch_size: usize) -> Re
         OutputFormat::Parquet => Ok(Box::new(ParquetExportWriter::new(path, batch_size)?)),
         OutputFormat::Csv => Ok(Box::new(CsvExportWriter::new(path)?)),
         OutputFormat::JsonLines => Ok(Box::new(JsonLinesExportWriter::new(path)?)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flat partitioned writer (for events / instructions extraction)
+// ---------------------------------------------------------------------------
+
+/// Writes [`FlatRecord`]s partitioned by `name` field into separate files.
+///
+/// Each partition (event name / instruction name) gets its own file with a
+/// schema derived from the IDL type definition.
+pub struct FlatPartitionedWriter {
+    base_dir: PathBuf,
+    format: OutputFormat,
+    schemas: HashMap<String, SchemaRef>,
+    parquet_writers: HashMap<String, (ArrowWriter<File>, SchemaRef)>,
+    jsonl_writers: HashMap<String, BufWriter<File>>,
+}
+
+impl FlatPartitionedWriter {
+    /// Create a new flat partitioned writer.
+    ///
+    /// `schemas` maps event/instruction names to their Arrow schemas.
+    pub fn new(
+        base_dir: &Path,
+        format: OutputFormat,
+        schemas: HashMap<String, SchemaRef>,
+    ) -> Result<Self, Error> {
+        fs::create_dir_all(base_dir).map_err(Error::Io)?;
+        Ok(Self {
+            base_dir: base_dir.to_path_buf(),
+            format,
+            schemas,
+            parquet_writers: HashMap::new(),
+            jsonl_writers: HashMap::new(),
+        })
+    }
+
+    /// Write a batch of flat records, routing each to its partition by `name`.
+    pub fn write_records(&mut self, records: &[FlatRecord]) -> Result<(), Error> {
+        let mut groups: HashMap<&str, Vec<&FlatRecord>> = HashMap::new();
+        for r in records {
+            groups.entry(r.name.as_str()).or_default().push(r);
+        }
+
+        for (name, group) in groups {
+            match self.format {
+                OutputFormat::Parquet => {
+                    let schema = match self.schemas.get(name) {
+                        Some(s) => Arc::clone(s),
+                        None => continue,
+                    };
+
+                    if !self.parquet_writers.contains_key(name) {
+                        let path = self.base_dir.join(format!("{name}.parquet"));
+                        let file = File::create(&path).map_err(Error::Io)?;
+                        let props = WriterProperties::builder()
+                            .set_compression(Compression::ZSTD(
+                                ZstdLevel::try_new(3).expect("valid zstd level"),
+                            ))
+                            .build();
+                        let writer =
+                            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))
+                                .map_err(|e| Error::Parquet(e.to_string()))?;
+                        self.parquet_writers
+                            .insert(name.to_string(), (writer, Arc::clone(&schema)));
+                    }
+
+                    let (writer, schema) =
+                        self.parquet_writers.get_mut(name).expect("just inserted");
+                    let owned: Vec<FlatRecord> = group.into_iter().cloned().collect();
+                    let batch = flat_records_to_batch(schema, &owned)?;
+                    writer
+                        .write(&batch)
+                        .map_err(|e| Error::Parquet(e.to_string()))?;
+                }
+                OutputFormat::JsonLines | OutputFormat::Csv => {
+                    let ext = match self.format {
+                        OutputFormat::JsonLines => "jsonl",
+                        OutputFormat::Csv => "csv",
+                        _ => unreachable!(),
+                    };
+                    if !self.jsonl_writers.contains_key(name) {
+                        let path = self.base_dir.join(format!("{name}.{ext}"));
+                        let file = File::create(&path).map_err(Error::Io)?;
+                        self.jsonl_writers
+                            .insert(name.to_string(), BufWriter::new(file));
+                    }
+                    let w = self.jsonl_writers.get_mut(name).expect("just inserted");
+                    for r in &group {
+                        serde_json::to_writer(&mut *w, r).map_err(Error::Json)?;
+                        writeln!(w).map_err(Error::Io)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize all partition writers.
+    pub fn finish(self) -> Result<(), Error> {
+        for (_, (writer, _)) in self.parquet_writers {
+            writer
+                .close()
+                .map_err(|e| Error::Parquet(e.to_string()))?;
+        }
+        for (_, mut w) in self.jsonl_writers {
+            w.flush().map_err(Error::Io)?;
+        }
+        Ok(())
     }
 }

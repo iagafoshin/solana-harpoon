@@ -55,6 +55,11 @@ enum Commands {
         /// Batch size for Parquet writer (records per batch).
         #[arg(long, default_value_t = 50_000)]
         batch_size: usize,
+
+        /// Extraction mode: raw (full transactions), events (decoded events from logs),
+        /// instructions (decoded instructions). Requires --idl for events/instructions.
+        #[arg(long, default_value = "raw")]
+        extract: String,
     },
 
     /// Offline decode: apply IDL decoder to existing Parquet with raw instruction data.
@@ -86,6 +91,15 @@ enum Commands {
         #[arg(long, conflicts_with = "car")]
         epoch: Option<u64>,
     },
+}
+
+fn parse_extract_mode(s: &str) -> anyhow::Result<pipeline::ExtractMode> {
+    match s {
+        "raw" => Ok(pipeline::ExtractMode::Raw),
+        "events" => Ok(pipeline::ExtractMode::Events),
+        "instructions" => Ok(pipeline::ExtractMode::Instructions),
+        other => anyhow::bail!("unknown extract mode: {other} (expected: raw, events, instructions)"),
+    }
 }
 
 fn parse_output_format(s: &str) -> anyhow::Result<harpoon_export::OutputFormat> {
@@ -125,7 +139,12 @@ async fn main() -> anyhow::Result<()> {
             stream_download,
             keep_car,
             batch_size,
+            extract,
         } => {
+            let extract_mode = parse_extract_mode(&extract)?;
+            if extract_mode != pipeline::ExtractMode::Raw && idl.is_none() {
+                anyhow::bail!("--idl is required for --extract events/instructions");
+            }
             cmd::ingest::run(
                 &parse_epoch_range(&epochs)?,
                 &program,
@@ -135,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 stream_download,
                 keep_car,
                 batch_size,
+                extract_mode,
             )
             .await
         }

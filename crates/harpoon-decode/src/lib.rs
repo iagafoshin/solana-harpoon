@@ -1,5 +1,5 @@
 mod borsh;
-mod idl;
+pub mod idl;
 
 use {
     crate::{
