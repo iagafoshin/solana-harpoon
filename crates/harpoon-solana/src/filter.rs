@@ -30,6 +30,28 @@ fn program_matches(program_id_index: u8, account_keys: &[Pubkey], targets: &[Pub
         .is_some_and(|key| targets.contains(key))
 }
 
+/// Quick check: is any target program present in the account keys at all?
+///
+/// If not, the transaction cannot possibly invoke the target program — not even
+/// via CPI — because inner instruction `program_id_index` values reference the
+/// same account-key array.
+///
+/// For v0 transactions the static keys may not include addresses loaded via
+/// address-lookup tables, so this is a conservative fast-reject: a `false`
+/// return means "definitely no match", but `true` means "maybe — check further".
+pub fn could_match_programs(target_programs: &[Pubkey], account_keys: &[Pubkey]) -> bool {
+    target_programs.iter().any(|t| account_keys.contains(t))
+}
+
+/// Check whether any **outer** (top-level) instruction invokes a target program.
+pub fn matches_outer_programs(
+    targets: &[Pubkey],
+    account_keys: &[Pubkey],
+    instructions: &[solana_sdk::instruction::CompiledInstruction],
+) -> bool {
+    matches_outer(targets, account_keys, instructions)
+}
+
 fn matches_outer(
     targets: &[Pubkey],
     account_keys: &[Pubkey],

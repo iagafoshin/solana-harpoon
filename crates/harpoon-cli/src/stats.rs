@@ -14,6 +14,7 @@ pub struct PipelineStats {
     pub total_blocks: AtomicU64,
     pub metadata_errors: AtomicU64,
     pub decode_errors: AtomicU64,
+    pub metadata_skipped: AtomicU64,
 }
 
 impl Default for PipelineStats {
@@ -24,6 +25,7 @@ impl Default for PipelineStats {
             total_blocks: AtomicU64::new(0),
             metadata_errors: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            metadata_skipped: AtomicU64::new(0),
         }
     }
 }

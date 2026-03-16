@@ -474,7 +474,7 @@ fn process_batch(
     prepared
         .into_par_iter()
         .filter_map(|ptx| {
-            match process_single_tx(ptx, target_programs, idl_decoder, timing) {
+            match process_single_tx(ptx, target_programs, idl_decoder, stats, timing) {
                 Ok(Some(record)) => {
                     stats.matching_transactions.fetch_add(1, Ordering::Relaxed);
                     Some(record)
@@ -493,10 +493,12 @@ fn process_single_tx(
     ptx: PreparedTx,
     target_programs: &HashSet<Pubkey>,
     idl_decoder: &Option<Arc<IdlDecoder>>,
+    stats: &PipelineStats,
     timing: &TimingStats,
 ) -> anyhow::Result<Option<TransactionRecord>> {
     let sample = timing.should_sample();
 
+    // Phase 1: decode transaction (cheap ~2μs bincode) and check outer instructions.
     let t0 = Instant::now();
     let tx =
         harpoon_solana::decode_transaction(&ptx.tx_data).context("tx decode")?;
@@ -507,6 +509,35 @@ fn process_single_tx(
         sample,
     );
 
+    let static_keys = match &tx.message {
+        VersionedMessage::Legacy(msg) => &msg.account_keys,
+        VersionedMessage::V0(msg) => &msg.account_keys,
+    };
+    let outer_instructions = match &tx.message {
+        VersionedMessage::Legacy(msg) => &msg.instructions,
+        VersionedMessage::V0(msg) => &msg.instructions,
+    };
+
+    let t2 = Instant::now();
+    let target_slice: Vec<Pubkey> = target_programs.iter().copied().collect();
+    let outer_matched =
+        harpoon_solana::matches_outer_programs(&target_slice, static_keys, outer_instructions);
+    timing.record(
+        &timing.match_check_ns,
+        &timing.match_check_samples,
+        t2.elapsed(),
+        sample,
+    );
+
+    // Fast reject: if the target program isn't even in the static account keys,
+    // it can't appear in inner instructions either (for legacy txs this is exact;
+    // for v0 it's conservative since loaded ALT addresses are rare program targets).
+    if !outer_matched && !harpoon_solana::could_match_programs(&target_slice, static_keys) {
+        stats.metadata_skipped.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+
+    // Phase 2: decode metadata (expensive zstd + protobuf) — only for potential matches.
     let t1 = Instant::now();
     let meta = ptx
         .meta_data
@@ -530,28 +561,17 @@ fn process_single_tx(
 
     let account_keys = harpoon_solana::resolve_full_account_keys(&tx, meta.as_ref());
 
-    let outer_instructions = match &tx.message {
-        VersionedMessage::Legacy(msg) => &msg.instructions,
-        VersionedMessage::V0(msg) => &msg.instructions,
-    };
-
-    let t2 = Instant::now();
-    let target_slice: Vec<Pubkey> = target_programs.iter().copied().collect();
-    let matched = harpoon_solana::matches_programs(
-        &target_slice,
-        &account_keys,
-        outer_instructions,
-        meta.as_ref(),
-    );
-    timing.record(
-        &timing.match_check_ns,
-        &timing.match_check_samples,
-        t2.elapsed(),
-        sample,
-    );
-
-    if !matched {
-        return Ok(None);
+    // If outer didn't match, we need to verify via inner instructions with full keys.
+    if !outer_matched {
+        let matched = harpoon_solana::matches_programs(
+            &target_slice,
+            &account_keys,
+            outer_instructions,
+            meta.as_ref(),
+        );
+        if !matched {
+            return Ok(None);
+        }
     }
 
     let t3 = Instant::now();
@@ -706,6 +726,7 @@ fn process_extract_batch(
                 target_programs,
                 idl_decoder,
                 extract_mode,
+                stats,
                 timing,
             ) {
                 Ok(records) => {
@@ -728,10 +749,12 @@ fn process_single_tx_extract(
     target_programs: &HashSet<Pubkey>,
     idl_decoder: &IdlDecoder,
     extract_mode: ExtractMode,
+    stats: &PipelineStats,
     timing: &TimingStats,
 ) -> anyhow::Result<Vec<FlatRecord>> {
     let sample = timing.should_sample();
 
+    // Phase 1: decode transaction (cheap) and check outer instructions.
     let t0 = Instant::now();
     let tx =
         harpoon_solana::decode_transaction(&ptx.tx_data).context("tx decode")?;
@@ -742,6 +765,32 @@ fn process_single_tx_extract(
         sample,
     );
 
+    let static_keys = match &tx.message {
+        VersionedMessage::Legacy(msg) => &msg.account_keys,
+        VersionedMessage::V0(msg) => &msg.account_keys,
+    };
+    let outer_instructions = match &tx.message {
+        VersionedMessage::Legacy(msg) => &msg.instructions,
+        VersionedMessage::V0(msg) => &msg.instructions,
+    };
+
+    let t2 = Instant::now();
+    let target_slice: Vec<Pubkey> = target_programs.iter().copied().collect();
+    let outer_matched =
+        harpoon_solana::matches_outer_programs(&target_slice, static_keys, outer_instructions);
+    timing.record(
+        &timing.match_check_ns,
+        &timing.match_check_samples,
+        t2.elapsed(),
+        sample,
+    );
+
+    if !outer_matched && !harpoon_solana::could_match_programs(&target_slice, static_keys) {
+        stats.metadata_skipped.fetch_add(1, Ordering::Relaxed);
+        return Ok(Vec::new());
+    }
+
+    // Phase 2: decode metadata (expensive).
     let t1 = Instant::now();
     let meta = ptx
         .meta_data
@@ -765,28 +814,16 @@ fn process_single_tx_extract(
 
     let account_keys = harpoon_solana::resolve_full_account_keys(&tx, meta.as_ref());
 
-    let outer_instructions = match &tx.message {
-        VersionedMessage::Legacy(msg) => &msg.instructions,
-        VersionedMessage::V0(msg) => &msg.instructions,
-    };
-
-    let t2 = Instant::now();
-    let target_slice: Vec<Pubkey> = target_programs.iter().copied().collect();
-    let matched = harpoon_solana::matches_programs(
-        &target_slice,
-        &account_keys,
-        outer_instructions,
-        meta.as_ref(),
-    );
-    timing.record(
-        &timing.match_check_ns,
-        &timing.match_check_samples,
-        t2.elapsed(),
-        sample,
-    );
-
-    if !matched {
-        return Ok(Vec::new());
+    if !outer_matched {
+        let matched = harpoon_solana::matches_programs(
+            &target_slice,
+            &account_keys,
+            outer_instructions,
+            meta.as_ref(),
+        );
+        if !matched {
+            return Ok(Vec::new());
+        }
     }
 
     let signature = tx
@@ -919,6 +956,7 @@ fn print_summary(stats: &PipelineStats, start_time: Instant) {
     let matched = stats.matching_transactions.load(Ordering::Relaxed);
     let metadata_errors = stats.metadata_errors.load(Ordering::Relaxed);
     let decode_errors = stats.decode_errors.load(Ordering::Relaxed);
+    let metadata_skipped = stats.metadata_skipped.load(Ordering::Relaxed);
     let blocks = stats.total_blocks.load(Ordering::Relaxed);
     let speed = if elapsed.as_secs_f64() > 0.0 {
         (total as f64 / elapsed.as_secs_f64()) as u64
@@ -934,6 +972,10 @@ fn print_summary(stats: &PipelineStats, start_time: Instant) {
     eprintln!(
         "  matched tx:          {}",
         crate::stats::format_number(matched)
+    );
+    eprintln!(
+        "  metadata skipped:    {}",
+        crate::stats::format_number(metadata_skipped)
     );
     eprintln!(
         "  metadata errors:     {}",

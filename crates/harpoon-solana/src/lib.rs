@@ -9,7 +9,7 @@ pub use {
         extract_instructions, resolve_full_account_keys, AccountBalanceDelta, ParsedInstruction,
         TokenBalanceDelta,
     },
-    filter::matches_programs,
+    filter::{could_match_programs, matches_outer_programs, matches_programs},
 };
 
 /// Errors produced by this crate.
