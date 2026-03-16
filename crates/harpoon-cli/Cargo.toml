@@ -1,0 +1,34 @@
+[package]
+name = "harpoon-cli"
+version = "0.1.0"
+description = "CLI for solana-harpoon: ingest, decode, inspect Solana CAR archives"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "harpoon"
+path = "src/main.rs"
+
+[dependencies]
+harpoon-car = { path = "../harpoon-car" }
+harpoon-solana = { path = "../harpoon-solana" }
+harpoon-decode = { path = "../harpoon-decode" }
+harpoon-export = { path = "../harpoon-export" }
+
+anyhow = "1.0"
+bs58 = "0.5"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+rayon = "1"
+solana-sdk = "~2.2.2"
+tikv-jemallocator = "0.6"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+serde_json = "1.0"
+
+[lints]
+workspace = true

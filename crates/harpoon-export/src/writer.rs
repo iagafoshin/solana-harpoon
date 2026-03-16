@@ -316,7 +316,7 @@ impl PartitionedWriter {
 // ---------------------------------------------------------------------------
 
 /// Create a single (non-partitioned) export writer for the given format.
-pub fn create_writer(path: &Path, format: OutputFormat, batch_size: usize) -> Result<Box<dyn ExportWriter>, Error> {
+pub fn create_writer(path: &Path, format: OutputFormat, batch_size: usize) -> Result<Box<dyn ExportWriter + Send>, Error> {
     match format {
         OutputFormat::Parquet => Ok(Box::new(ParquetExportWriter::new(path, batch_size)?)),
         OutputFormat::Csv => Ok(Box::new(CsvExportWriter::new(path)?)),

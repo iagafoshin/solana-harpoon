@@ -3,10 +3,10 @@
 //! These mirror the shapes from `harpoon-solana` but are self-contained
 //! so that `harpoon-export` has no dependency on the Solana SDK.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A fully resolved transaction record ready for export.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionRecord {
     pub slot: u64,
     pub block_time: Option<i64>,
@@ -22,7 +22,7 @@ pub struct TransactionRecord {
 }
 
 /// SOL balance change for one account within a transaction.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountBalanceDelta {
     pub account: String,
     pub pre_lamports: u64,
@@ -31,7 +31,7 @@ pub struct AccountBalanceDelta {
 }
 
 /// Token balance change for one (mint, owner, account_index) triple.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBalanceDelta {
     pub mint: String,
     pub owner: String,
@@ -41,7 +41,7 @@ pub struct TokenBalanceDelta {
 }
 
 /// A single instruction with resolved account keys and base58-encoded data.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionRecord {
     pub program_id: String,
     pub data: String,
