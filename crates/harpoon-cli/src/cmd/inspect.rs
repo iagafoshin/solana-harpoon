@@ -39,7 +39,6 @@ pub async fn run(car_path: Option<&Path>, epoch: Option<u64>) -> anyhow::Result<
     let mut total_nodes = 0u64;
     let mut first_slot: Option<u64> = None;
     let mut last_slot: Option<u64> = None;
-    let program_counts: HashMap<String, u64> = HashMap::new();
     let mut tx_count = 0u64;
 
     for raw_result in reader {
@@ -102,16 +101,6 @@ pub async fn run(car_path: Option<&Path>, epoch: Option<u64>) -> anyhow::Result<
         eprintln!("Last slot:     {last}");
     }
     eprintln!("Transactions:  {tx_count}");
-
-    if !program_counts.is_empty() {
-        eprintln!();
-        eprintln!("Top programs:");
-        let mut sorted: Vec<_> = program_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        for (program, count) in sorted.iter().take(20) {
-            eprintln!("  {program}  {count}");
-        }
-    }
 
     Ok(())
 }

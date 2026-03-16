@@ -433,35 +433,35 @@ impl DynamicBuilder {
 
     fn append_json(&mut self, value: Option<&serde_json::Value>) {
         match self {
-            Self::UInt8(b) => match value.and_then(|v| v.as_u64()) {
+            Self::UInt8(b) => match value.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))) {
                 Some(n) => b.append_value(n as u8),
                 None => b.append_null(),
             },
-            Self::UInt16(b) => match value.and_then(|v| v.as_u64()) {
+            Self::UInt16(b) => match value.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))) {
                 Some(n) => b.append_value(n as u16),
                 None => b.append_null(),
             },
-            Self::UInt32(b) => match value.and_then(|v| v.as_u64()) {
+            Self::UInt32(b) => match value.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))) {
                 Some(n) => b.append_value(n as u32),
                 None => b.append_null(),
             },
-            Self::UInt64(b) => match value.and_then(|v| v.as_u64()) {
+            Self::UInt64(b) => match value.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))) {
                 Some(n) => b.append_value(n),
                 None => b.append_null(),
             },
-            Self::Int8(b) => match value.and_then(|v| v.as_i64()) {
+            Self::Int8(b) => match value.and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))) {
                 Some(n) => b.append_value(n as i8),
                 None => b.append_null(),
             },
-            Self::Int16(b) => match value.and_then(|v| v.as_i64()) {
+            Self::Int16(b) => match value.and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))) {
                 Some(n) => b.append_value(n as i16),
                 None => b.append_null(),
             },
-            Self::Int32(b) => match value.and_then(|v| v.as_i64()) {
+            Self::Int32(b) => match value.and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))) {
                 Some(n) => b.append_value(n as i32),
                 None => b.append_null(),
             },
-            Self::Int64(b) => match value.and_then(|v| v.as_i64()) {
+            Self::Int64(b) => match value.and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))) {
                 Some(n) => b.append_value(n),
                 None => b.append_null(),
             },

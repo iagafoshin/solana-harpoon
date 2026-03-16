@@ -34,7 +34,6 @@ use {
     solana_sdk::{message::VersionedMessage, pubkey::Pubkey},
     std::{
         collections::{HashMap, HashSet},
-        convert::TryFrom,
         sync::{
             atomic::Ordering,
             mpsc::{SyncSender, sync_channel},
