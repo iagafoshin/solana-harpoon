@@ -328,15 +328,28 @@ pub fn create_writer(path: &Path, format: OutputFormat, batch_size: usize) -> Re
 // Flat partitioned writer (for events / instructions extraction)
 // ---------------------------------------------------------------------------
 
+/// Maximum rows per partitioned output file before splitting to a new part.
+const FLAT_PARTITION_MAX_ROWS: u64 = 500_000;
+
+/// State for a single Parquet partition (one event/instruction name).
+struct ParquetPartition {
+    writer: ArrowWriter<File>,
+    schema: SchemaRef,
+    rows: u64,
+    part: u32,
+}
+
 /// Writes [`FlatRecord`]s partitioned by `name` field into separate files.
 ///
-/// Each partition (event name / instruction name) gets its own file with a
-/// schema derived from the IDL type definition.
+/// Each partition (event name / instruction name) gets its own subdirectory
+/// under `base_dir`, with files named `{epoch}_{name}_part_{NNN}.ext`.
+/// Files are automatically split when they exceed 500,000 rows.
 pub struct FlatPartitionedWriter {
     base_dir: PathBuf,
+    epoch: u64,
     format: OutputFormat,
     schemas: HashMap<String, SchemaRef>,
-    parquet_writers: HashMap<String, (ArrowWriter<File>, SchemaRef)>,
+    parquet_writers: HashMap<String, ParquetPartition>,
     jsonl_writers: HashMap<String, BufWriter<File>>,
 }
 
@@ -344,14 +357,17 @@ impl FlatPartitionedWriter {
     /// Create a new flat partitioned writer.
     ///
     /// `schemas` maps event/instruction names to their Arrow schemas.
+    /// `epoch` is used for file naming: `{epoch}_{name}_part_000.parquet`.
     pub fn new(
         base_dir: &Path,
         format: OutputFormat,
         schemas: HashMap<String, SchemaRef>,
+        epoch: u64,
     ) -> Result<Self, Error> {
         fs::create_dir_all(base_dir).map_err(Error::Io)?;
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
+            epoch,
             format,
             schemas,
             parquet_writers: HashMap::new(),
@@ -375,39 +391,37 @@ impl FlatPartitionedWriter {
                     };
 
                     if !self.parquet_writers.contains_key(name) {
-                        let path = self.base_dir.join(format!("{name}.parquet"));
-                        let file = File::create(&path).map_err(Error::Io)?;
-                        let props = WriterProperties::builder()
-                            .set_compression(Compression::ZSTD(
-                                ZstdLevel::try_new(3).expect("valid zstd level"),
-                            ))
-                            .build();
-                        let writer =
-                            ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))
-                                .map_err(|e| Error::Parquet(e.to_string()))?;
-                        self.parquet_writers
-                            .insert(name.to_string(), (writer, Arc::clone(&schema)));
+                        let partition =
+                            self.create_parquet_partition(name, &schema, 0)?;
+                        self.parquet_writers.insert(name.to_string(), partition);
                     }
 
-                    let (writer, schema) =
+                    let partition =
                         self.parquet_writers.get_mut(name).expect("just inserted");
                     let owned: Vec<FlatRecord> = group.into_iter().cloned().collect();
-                    let batch = flat_records_to_batch(schema, &owned)?;
-                    writer
+                    let batch = flat_records_to_batch(&partition.schema, &owned)?;
+                    partition
+                        .writer
                         .write(&batch)
                         .map_err(|e| Error::Parquet(e.to_string()))?;
+                    partition.rows += batch.num_rows() as u64;
+
+                    // Split to a new part file if we exceeded the row limit.
+                    if partition.rows >= FLAT_PARTITION_MAX_ROWS {
+                        let next_part = partition.part + 1;
+                        let old = self.parquet_writers.remove(name).unwrap();
+                        old.writer
+                            .close()
+                            .map_err(|e| Error::Parquet(e.to_string()))?;
+                        let new_partition =
+                            self.create_parquet_partition(name, &schema, next_part)?;
+                        self.parquet_writers.insert(name.to_string(), new_partition);
+                    }
                 }
                 OutputFormat::JsonLines | OutputFormat::Csv => {
-                    let ext = match self.format {
-                        OutputFormat::JsonLines => "jsonl",
-                        OutputFormat::Csv => "csv",
-                        _ => unreachable!(),
-                    };
                     if !self.jsonl_writers.contains_key(name) {
-                        let path = self.base_dir.join(format!("{name}.{ext}"));
-                        let file = File::create(&path).map_err(Error::Io)?;
-                        self.jsonl_writers
-                            .insert(name.to_string(), BufWriter::new(file));
+                        let w = self.create_text_writer(name)?;
+                        self.jsonl_writers.insert(name.to_string(), w);
                     }
                     let w = self.jsonl_writers.get_mut(name).expect("just inserted");
                     for r in &group {
@@ -422,8 +436,9 @@ impl FlatPartitionedWriter {
 
     /// Finalize all partition writers.
     pub fn finish(self) -> Result<(), Error> {
-        for (_, (writer, _)) in self.parquet_writers {
-            writer
+        for (_, partition) in self.parquet_writers {
+            partition
+                .writer
                 .close()
                 .map_err(|e| Error::Parquet(e.to_string()))?;
         }
@@ -431,5 +446,53 @@ impl FlatPartitionedWriter {
             w.flush().map_err(Error::Io)?;
         }
         Ok(())
+    }
+
+    fn partition_dir(&self, name: &str) -> PathBuf {
+        self.base_dir.join(name)
+    }
+
+    fn create_parquet_partition(
+        &self,
+        name: &str,
+        schema: &SchemaRef,
+        part: u32,
+    ) -> Result<ParquetPartition, Error> {
+        let dir = self.partition_dir(name);
+        fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let path = dir.join(format!(
+            "{}_{}_part_{:03}.parquet",
+            self.epoch, name, part
+        ));
+        let file = File::create(&path).map_err(Error::Io)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(3).expect("valid zstd level"),
+            ))
+            .build();
+        let writer = ArrowWriter::try_new(file, Arc::clone(schema), Some(props))
+            .map_err(|e| Error::Parquet(e.to_string()))?;
+        Ok(ParquetPartition {
+            writer,
+            schema: Arc::clone(schema),
+            rows: 0,
+            part,
+        })
+    }
+
+    fn create_text_writer(&self, name: &str) -> Result<BufWriter<File>, Error> {
+        let dir = self.partition_dir(name);
+        fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let ext = match self.format {
+            OutputFormat::JsonLines => "jsonl",
+            OutputFormat::Csv => "csv",
+            _ => unreachable!(),
+        };
+        let path = dir.join(format!(
+            "{}_{}_part_000.{ext}",
+            self.epoch, name
+        ));
+        let file = File::create(&path).map_err(Error::Io)?;
+        Ok(BufWriter::new(file))
     }
 }

@@ -107,8 +107,7 @@ pub async fn run(
             }
             ExtractMode::Events | ExtractMode::Instructions => {
                 let schemas = extract_schemas.as_ref().unwrap().clone();
-                let output_subdir = output_dir.join(format!("epoch-{epoch}"));
-                let writer = FlatPartitionedWriter::new(&output_subdir, format, schemas)?;
+                let writer = FlatPartitionedWriter::new(output_dir, format, schemas, epoch)?;
                 let decoder = Arc::clone(idl_decoder.as_ref().unwrap());
 
                 run_extract_for_epoch(
