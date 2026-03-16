@@ -1095,6 +1095,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harpoon-decode"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "const-hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harpoon-solana"
 version = "0.1.0"
 dependencies = [
