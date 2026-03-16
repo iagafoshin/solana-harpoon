@@ -18,7 +18,7 @@ use {
     anyhow::{anyhow, Context},
     base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD},
     bytes::Bytes,
-    harpoon_car::node::{Node, Nodes},
+    harpoon_car::node::{Kind, Node, Nodes},
     harpoon_decode::{
         Idl, IdlDecoder,
         idl::{IdlType, IdlTypeComplex, IdlTypeDefBody, StructFields},
@@ -43,6 +43,10 @@ use {
     },
     tokio::io::AsyncRead,
 };
+
+/// Node kinds needed by the pipeline. Entry, Subset, Epoch, Rewards are
+/// skipped — their CBOR is never deserialized, saving ~60-70% of parse work.
+const PIPELINE_KEEP_KINDS: &[Kind] = &[Kind::Transaction, Kind::Block, Kind::DataFrame];
 
 /// Extraction mode for the ingest pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +206,12 @@ pub async fn run_async_pipeline(
     let mut buffer: Vec<TransactionRecord> = Vec::new();
 
     loop {
-        let nodes = Nodes::read_until_block(&mut reader).await?;
+        let nodes = Nodes::read_until_block_filtered(&mut reader, Some(PIPELINE_KEEP_KINDS)).await?;
         if nodes.nodes.is_empty() {
             break;
         }
 
-        let (_block_time, mut prepared) = prepare_nodes(&nodes, &stats, start_time, &pb);
+        let (_block_time, mut prepared) = prepare_nodes(nodes, &stats, start_time, &pb);
 
         process_chunks(
             &mut prepared,
@@ -286,12 +290,12 @@ pub async fn run_extract_pipeline(
     let mut buffer: Vec<FlatRecord> = Vec::new();
 
     loop {
-        let nodes = Nodes::read_until_block(&mut reader).await?;
+        let nodes = Nodes::read_until_block_filtered(&mut reader, Some(PIPELINE_KEEP_KINDS)).await?;
         if nodes.nodes.is_empty() {
             break;
         }
 
-        let (_block_time, mut prepared) = prepare_nodes(&nodes, &stats, start_time, &pb);
+        let (_block_time, mut prepared) = prepare_nodes(nodes, &stats, start_time, &pb);
 
         process_extract_chunks(
             &mut prepared,
@@ -329,8 +333,12 @@ pub async fn run_extract_pipeline(
 // ===========================================================================
 
 /// Prepare CAR nodes into `PreparedTx` entries.
+///
+/// Takes `Nodes` by value so transaction data can be moved instead of cloned.
+/// Metadata is reassembled in a first pass (needs shared references to
+/// look up DataFrame CIDs), then the map is drained to move tx bytes out.
 fn prepare_nodes(
-    nodes: &Nodes,
+    nodes: Nodes,
     stats: &PipelineStats,
     start_time: Instant,
     pb: &ProgressBar,
@@ -340,38 +348,55 @@ fn prepare_nodes(
         _ => None,
     });
 
-    let mut prepared = Vec::new();
+    // Phase 1: reassemble metadata while we still have shared access to
+    // the full node map (needed for multi-frame DataFrame CID lookups).
+    let mut meta_by_idx: Vec<(usize, u64, Option<Bytes>)> = Vec::new();
+    for (idx, node) in nodes.nodes.values().enumerate() {
+        if let Node::Transaction(frame) = node {
+            let total = stats.total_transactions.fetch_add(1, Ordering::Relaxed) + 1;
+            if total % 10_000 == 0 {
+                let matched = stats.matching_transactions.load(Ordering::Relaxed);
+                let speed = total as f64 / start_time.elapsed().as_secs_f64();
+                pb.set_message(format!(
+                    "tx={total} matched={matched} speed={:.0} tx/s slot={}",
+                    speed, frame.slot
+                ));
+            }
 
-    for node in nodes.nodes.values() {
+            let meta_data = match nodes.reassemble_dataframes(&frame.metadata) {
+                Ok(bytes) if bytes.is_empty() => None,
+                Ok(bytes) => Some(Bytes::from(bytes)),
+                Err(err) => {
+                    eprintln!(
+                        "[warn] slot={} failed to reassemble metadata: {err}",
+                        frame.slot
+                    );
+                    stats.metadata_errors.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+
+            meta_by_idx.push((idx, frame.slot, meta_data));
+        }
+    }
+
+    // Phase 2: drain the map to take ownership, moving tx data instead of
+    // cloning. We match by index so metadata lines up with the right tx.
+    let mut meta_iter = meta_by_idx.into_iter().peekable();
+    let mut prepared = Vec::with_capacity(meta_iter.len());
+
+    for (idx, (_cid, node)) in nodes.nodes.into_iter().enumerate() {
         match node {
             Node::Transaction(frame) => {
-                let total = stats.total_transactions.fetch_add(1, Ordering::Relaxed) + 1;
-                if total % 10_000 == 0 {
-                    let matched = stats.matching_transactions.load(Ordering::Relaxed);
-                    let speed = total as f64 / start_time.elapsed().as_secs_f64();
-                    pb.set_message(format!(
-                        "tx={total} matched={matched} speed={:.0} tx/s slot={}",
-                        speed, frame.slot
-                    ));
-                }
-
-                let meta_data = match nodes.reassemble_dataframes(&frame.metadata) {
-                    Ok(bytes) if bytes.is_empty() => None,
-                    Ok(bytes) => Some(Bytes::from(bytes)),
-                    Err(err) => {
-                        eprintln!(
-                            "[warn] slot={} failed to reassemble metadata: {err}",
-                            frame.slot
-                        );
-                        stats.metadata_errors.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
-                };
+                let (_mi, _slot, meta_data) = meta_iter
+                    .next()
+                    .expect("metadata count must match transaction count");
+                debug_assert_eq!(_mi, idx);
 
                 prepared.push(PreparedTx {
                     slot: frame.slot,
                     block_time,
-                    tx_data: Bytes::from(frame.data.data.clone()),
+                    tx_data: Bytes::from(frame.data.data), // moved, not cloned
                     meta_data,
                 });
             }

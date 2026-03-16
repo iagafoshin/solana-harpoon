@@ -189,6 +189,29 @@ impl RawNode {
     pub fn get_data(&self) -> &[u8] {
         &self.data[self.data_offset..]
     }
+
+    /// Peek at the node kind from raw CBOR data without full deserialization.
+    ///
+    /// Old Faithful CAR nodes are CBOR arrays where the first element is a
+    /// small unsigned integer indicating the kind. This reads just those two
+    /// bytes (array header + kind byte) instead of parsing the entire CBOR
+    /// payload.
+    pub fn peek_kind(&self) -> Option<Kind> {
+        let data = self.get_data();
+        if data.len() < 2 {
+            return None;
+        }
+        // CBOR major type 4 (array): top 3 bits = 0b100 → first byte & 0xe0 == 0x80
+        if (data[0] & 0xe0) != 0x80 {
+            return None;
+        }
+        // First element: major type 0 (unsigned int) for values 0..23
+        let kind_byte = data[1];
+        if (kind_byte & 0xe0) != 0x00 {
+            return None;
+        }
+        Kind::from_u64(kind_byte as u64)
+    }
 }
 
 pub struct NodeReader<R> {
@@ -254,14 +277,40 @@ impl Nodes {
     pub async fn read_until_block<R: AsyncRead + Unpin>(
         reader: &mut NodeReader<R>,
     ) -> Result<Self, NodeError> {
+        Self::read_until_block_filtered(reader, None).await
+    }
+
+    /// Read nodes until a Block node is found, optionally skipping full CBOR
+    /// deserialization for node kinds not in `keep_kinds`.
+    ///
+    /// Block nodes are always kept (they signal the end of the group).
+    /// Pass `Some(&[Kind::Transaction, Kind::Block, Kind::DataFrame])` to
+    /// skip parsing Entry, Subset, Epoch, and Rewards nodes — typically a
+    /// 60-70% reduction in CBOR work.
+    pub async fn read_until_block_filtered<R: AsyncRead + Unpin>(
+        reader: &mut NodeReader<R>,
+        keep_kinds: Option<&[Kind]>,
+    ) -> Result<Self, NodeError> {
         let mut block = Self::default();
         let mut finished = false;
         while !finished {
-            let Some(node) = reader.read_node().await? else {
+            let Some(raw) = reader.read_node().await? else {
                 break;
             };
-            let node = NodeWithCid::try_from(&node)?;
-            finished = matches!(node.node, Node::Block(_));
+            let kind = raw.peek_kind();
+            let is_block = kind == Some(Kind::Block);
+            finished = is_block;
+
+            // Skip full CBOR deserialization for unwanted kinds
+            if let Some(filter) = keep_kinds {
+                if let Some(k) = kind {
+                    if !filter.contains(&k) {
+                        continue;
+                    }
+                }
+            }
+
+            let node = NodeWithCid::try_from(&raw)?;
             block.push(node);
         }
         Ok(block)
