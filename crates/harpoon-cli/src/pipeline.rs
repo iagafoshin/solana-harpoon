@@ -18,7 +18,7 @@ use {
     anyhow::{anyhow, Context},
     base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD},
     bytes::Bytes,
-    harpoon_car::node::{Kind, Node, Nodes},
+    harpoon_car::node::{Kind, Node, NodeWithCid, Nodes},
     harpoon_decode::{
         Idl, IdlDecoder,
         idl::{IdlType, IdlTypeComplex, IdlTypeDefBody, StructFields},
@@ -35,6 +35,7 @@ use {
     std::{
         cell::RefCell,
         collections::{HashMap, HashSet},
+        path::PathBuf,
         sync::{
             atomic::Ordering,
             mpsc::{SyncSender, sync_channel},
@@ -334,6 +335,218 @@ pub async fn run_extract_pipeline(
     timing.print_summary();
 
     Ok(())
+}
+
+// ===========================================================================
+// Mmap pipelines (local file fast path)
+// ===========================================================================
+
+/// Run the 3-stage pipeline on a local CAR file via mmap (raw mode).
+///
+/// This is the fast path for downloaded CAR files. The mmap reader runs on
+/// a dedicated std::thread — no async runtime overhead. Rayon processing and
+/// the writer thread are identical to the async path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mmap_pipeline(
+    car_path: PathBuf,
+    target_programs: Arc<HashSet<Pubkey>>,
+    idl_decoder: Option<Arc<IdlDecoder>>,
+    mut writer: Box<dyn ExportWriter + Send>,
+    batch_size: usize,
+    stats: Arc<PipelineStats>,
+    timing: Arc<TimingStats>,
+) -> anyhow::Result<()> {
+    let mut mmap_reader = harpoon_car::MmapNodeReader::open(&car_path)
+        .with_context(|| format!("failed to mmap {car_path:?}"))?;
+
+    let (writer_tx, writer_rx) = sync_channel::<Vec<TransactionRecord>>(CHANNEL_BOUND);
+
+    let writer_timing = Arc::clone(&timing);
+    let writer_handle = std::thread::spawn(move || -> anyhow::Result<()> {
+        for batch in writer_rx.iter() {
+            let start = Instant::now();
+            writer.write_records(&batch)?;
+            writer_timing.record(
+                &writer_timing.parquet_write_ns,
+                &writer_timing.parquet_write_samples,
+                start.elapsed(),
+                true,
+            );
+        }
+        writer.finish()?;
+        Ok(())
+    });
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .expect("valid template"),
+    );
+
+    let start_time = Instant::now();
+    let mut buffer: Vec<TransactionRecord> = Vec::new();
+
+    loop {
+        let nodes = read_mmap_block(&mut mmap_reader);
+        if nodes.nodes.is_empty() {
+            break;
+        }
+
+        let (_block_time, mut prepared) = prepare_nodes(nodes, &stats, start_time, &pb);
+
+        process_chunks(
+            &mut prepared,
+            &target_programs,
+            &idl_decoder,
+            &stats,
+            &timing,
+            &mut buffer,
+            &writer_tx,
+            batch_size,
+        )?;
+    }
+
+    if !buffer.is_empty() {
+        writer_tx
+            .send(std::mem::take(&mut buffer))
+            .map_err(|_| anyhow!("writer thread gone"))?;
+    }
+    drop(writer_tx);
+
+    writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))??;
+
+    pb.finish_and_clear();
+    print_summary(&stats, start_time);
+    timing.print_summary();
+
+    Ok(())
+}
+
+/// Run the extract pipeline on a local CAR file via mmap (events/instructions mode).
+#[allow(clippy::too_many_arguments)]
+pub fn run_mmap_extract_pipeline(
+    car_path: PathBuf,
+    target_programs: Arc<HashSet<Pubkey>>,
+    idl_decoder: Arc<IdlDecoder>,
+    extract_mode: ExtractMode,
+    writer: FlatPartitionedWriter,
+    batch_size: usize,
+    stats: Arc<PipelineStats>,
+    timing: Arc<TimingStats>,
+) -> anyhow::Result<()> {
+    let mut mmap_reader = harpoon_car::MmapNodeReader::open(&car_path)
+        .with_context(|| format!("failed to mmap {car_path:?}"))?;
+
+    let (writer_tx, writer_rx) = sync_channel::<Vec<FlatRecord>>(CHANNEL_BOUND);
+
+    let writer_timing = Arc::clone(&timing);
+    let writer_handle = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut writer = writer;
+        for batch in writer_rx.iter() {
+            let start = Instant::now();
+            writer.write_records(&batch)?;
+            writer_timing.record(
+                &writer_timing.parquet_write_ns,
+                &writer_timing.parquet_write_samples,
+                start.elapsed(),
+                true,
+            );
+        }
+        writer.finish()?;
+        Ok(())
+    });
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .expect("valid template"),
+    );
+
+    let start_time = Instant::now();
+    let mut buffer: Vec<FlatRecord> = Vec::new();
+
+    loop {
+        let nodes = read_mmap_block(&mut mmap_reader);
+        if nodes.nodes.is_empty() {
+            break;
+        }
+
+        let (_block_time, mut prepared) = prepare_nodes(nodes, &stats, start_time, &pb);
+
+        process_extract_chunks(
+            &mut prepared,
+            &target_programs,
+            &idl_decoder,
+            extract_mode,
+            &stats,
+            &timing,
+            &mut buffer,
+            &writer_tx,
+            batch_size,
+        )?;
+    }
+
+    if !buffer.is_empty() {
+        writer_tx
+            .send(std::mem::take(&mut buffer))
+            .map_err(|_| anyhow!("writer thread gone"))?;
+    }
+    drop(writer_tx);
+
+    writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))??;
+
+    pb.finish_and_clear();
+    print_summary(&stats, start_time);
+    timing.print_summary();
+
+    Ok(())
+}
+
+/// Synchronously read nodes from an mmap reader until a Block is found,
+/// applying the same kind filter as the async path.
+fn read_mmap_block(reader: &mut harpoon_car::MmapNodeReader) -> Nodes {
+    let mut block = Nodes::default();
+
+    for raw_result in reader.by_ref() {
+        let raw = match raw_result {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("[warn] mmap node read error: {err}");
+                continue;
+            }
+        };
+
+        let kind = raw.peek_kind();
+        let is_block = kind == Some(Kind::Block);
+
+        // Skip full CBOR deserialization for kinds not in PIPELINE_KEEP_KINDS
+        if let Some(k) = kind {
+            if !PIPELINE_KEEP_KINDS.contains(&k) {
+                if is_block {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        match NodeWithCid::try_from(&raw) {
+            Ok(node) => block.push(node),
+            Err(err) => {
+                eprintln!("[warn] mmap node parse error: {err}");
+                continue;
+            }
+        }
+
+        if is_block {
+            break;
+        }
+    }
+
+    block
 }
 
 // ===========================================================================

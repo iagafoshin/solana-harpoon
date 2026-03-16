@@ -176,18 +176,13 @@ async fn run_pipeline_for_epoch(
     } else {
         let car_path = download::download_car(epoch, output_dir)?;
 
-        let file = tokio::fs::File::open(&car_path).await?;
-        let reader = tokio::io::BufReader::new(file);
-        pipeline::run_async_pipeline(
-            Box::new(reader),
-            Arc::clone(target_programs),
-            idl_decoder.clone(),
-            writer,
-            batch_size,
-            stats,
-            timing,
-        )
-        .await?;
+        let tp = Arc::clone(target_programs);
+        let dec = idl_decoder.clone();
+        let mmap_path = car_path.clone();
+        tokio::task::spawn_blocking(move || {
+            pipeline::run_mmap_pipeline(mmap_path, tp, dec, writer, batch_size, stats, timing)
+        })
+        .await??;
 
         if !keep_car {
             download::remove_car(&car_path)?;
@@ -241,19 +236,21 @@ async fn run_extract_for_epoch(
     } else {
         let car_path = download::download_car(epoch, output_dir)?;
 
-        let file = tokio::fs::File::open(&car_path).await?;
-        let reader = tokio::io::BufReader::new(file);
-        pipeline::run_extract_pipeline(
-            Box::new(reader),
-            Arc::clone(target_programs),
-            idl_decoder,
-            extract_mode,
-            writer,
-            batch_size,
-            stats,
-            timing,
-        )
-        .await?;
+        let tp = Arc::clone(target_programs);
+        let mmap_path = car_path.clone();
+        tokio::task::spawn_blocking(move || {
+            pipeline::run_mmap_extract_pipeline(
+                mmap_path,
+                tp,
+                idl_decoder,
+                extract_mode,
+                writer,
+                batch_size,
+                stats,
+                timing,
+            )
+        })
+        .await??;
 
         if !keep_car {
             download::remove_car(&car_path)?;
