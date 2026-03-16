@@ -1645,6 +1645,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
+ "zstd",
 ]
 
 [[package]]

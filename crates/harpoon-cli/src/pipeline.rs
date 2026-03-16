@@ -33,6 +33,7 @@ use {
     rayon::prelude::*,
     solana_sdk::{message::VersionedMessage, pubkey::Pubkey},
     std::{
+        cell::RefCell,
         collections::{HashMap, HashSet},
         sync::{
             atomic::Ordering,
@@ -69,6 +70,13 @@ struct PreparedTx {
 
 const RAYON_CHUNK_SIZE: usize = 5_000;
 const CHANNEL_BOUND: usize = 4;
+
+thread_local! {
+    static ZSTD_STATE: RefCell<(zstd::bulk::Decompressor<'static>, Vec<u8>)> = RefCell::new((
+        zstd::bulk::Decompressor::new().expect("zstd init"),
+        Vec::with_capacity(4096),
+    ));
+}
 
 // ===========================================================================
 // Schema building from IDL
@@ -503,7 +511,12 @@ fn process_single_tx(
     let meta = ptx
         .meta_data
         .as_deref()
-        .map(harpoon_solana::decode_metadata)
+        .map(|compressed| {
+            ZSTD_STATE.with(|state| {
+                let (ref mut decompressor, ref mut buf) = *state.borrow_mut();
+                harpoon_solana::decode_metadata_reuse(compressed, decompressor, buf)
+            })
+        })
         .transpose()
         .ok()
         .flatten()
@@ -733,7 +746,12 @@ fn process_single_tx_extract(
     let meta = ptx
         .meta_data
         .as_deref()
-        .map(harpoon_solana::decode_metadata)
+        .map(|compressed| {
+            ZSTD_STATE.with(|state| {
+                let (ref mut decompressor, ref mut buf) = *state.borrow_mut();
+                harpoon_solana::decode_metadata_reuse(compressed, decompressor, buf)
+            })
+        })
         .transpose()
         .ok()
         .flatten()

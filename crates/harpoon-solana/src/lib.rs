@@ -3,7 +3,7 @@ mod extract;
 mod filter;
 
 pub use {
-    decode::{decode_metadata, decode_transaction},
+    decode::{decode_metadata, decode_metadata_reuse, decode_transaction},
     extract::{
         build_account_balance_deltas, build_token_balance_deltas, collect_program_ids,
         extract_instructions, resolve_full_account_keys, AccountBalanceDelta, ParsedInstruction,
