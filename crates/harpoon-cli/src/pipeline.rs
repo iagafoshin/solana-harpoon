@@ -136,13 +136,22 @@ pub fn build_extract_schemas(idl: &Idl, mode: ExtractMode) -> HashMap<String, Ar
                         fields: StructFields::Named(ref named),
                     } = td.ty
                     {
+                        // Common field names that must not collide with IDL fields
+                        const RESERVED_NAMES: &[&str] =
+                            &["slot", "block_time", "signature", "name", "program_id"];
+
                         let extra: Vec<ArrowField> = named
                             .iter()
                             .map(|f| {
                                 let dt = idl_type_to_arrow(&f.ty, &type_map);
                                 let nullable =
                                     matches!(&f.ty, IdlType::Complex(IdlTypeComplex::Option(_)));
-                                ArrowField::new(&f.name, dt, nullable)
+                                let col_name = if RESERVED_NAMES.contains(&f.name.as_str()) {
+                                    format!("token_{}", f.name)
+                                } else {
+                                    f.name.clone()
+                                };
+                                ArrowField::new(&col_name, dt, nullable)
                             })
                             .collect();
                         schemas.insert(event.name.clone(), build_flat_schema(&extra));
@@ -152,6 +161,9 @@ pub fn build_extract_schemas(idl: &Idl, mode: ExtractMode) -> HashMap<String, Ar
         }
         ExtractMode::Instructions => {
             for ix in &idl.instructions {
+                const RESERVED_NAMES: &[&str] =
+                    &["slot", "block_time", "signature", "name", "program_id"];
+
                 let extra: Vec<ArrowField> = ix
                     .args
                     .iter()
@@ -159,7 +171,12 @@ pub fn build_extract_schemas(idl: &Idl, mode: ExtractMode) -> HashMap<String, Ar
                         let dt = idl_type_to_arrow(&f.ty, &type_map);
                         let nullable =
                             matches!(&f.ty, IdlType::Complex(IdlTypeComplex::Option(_)));
-                        ArrowField::new(&f.name, dt, nullable)
+                        let col_name = if RESERVED_NAMES.contains(&f.name.as_str()) {
+                            format!("token_{}", f.name)
+                        } else {
+                            f.name.clone()
+                        };
+                        ArrowField::new(&col_name, dt, nullable)
                     })
                     .collect();
                 schemas.insert(ix.name.clone(), build_flat_schema(&extra));
@@ -1107,10 +1124,16 @@ fn extract_events_from_logs(
                         .last()
                         .map(|s| (*s).to_string())
                         .unwrap_or_default();
-                    let fields = match decoded.data {
+                    let mut fields = match decoded.data {
                         serde_json::Value::Object(map) => map,
                         _ => serde_json::Map::new(),
                     };
+                    // Rename fields that collide with FlatRecord common fields
+                    for reserved in &["slot", "block_time", "signature", "name", "program_id"] {
+                        if let Some(val) = fields.remove(*reserved) {
+                            fields.insert(format!("token_{reserved}"), val);
+                        }
+                    }
                     records.push(FlatRecord {
                         slot,
                         block_time,
@@ -1140,10 +1163,16 @@ fn extract_decoded_instructions(
     for ix in instructions {
         if let Ok(raw_bytes) = bs58::decode(&ix.data).into_vec() {
             if let Some(Ok(decoded)) = idl_decoder.try_decode_instruction(&raw_bytes) {
-                let fields = match decoded.data {
+                let mut fields = match decoded.data {
                     serde_json::Value::Object(map) => map,
                     _ => serde_json::Map::new(),
                 };
+                // Rename fields that collide with FlatRecord common fields
+                for reserved in &["slot", "block_time", "signature", "name", "program_id"] {
+                    if let Some(val) = fields.remove(*reserved) {
+                        fields.insert(format!("token_{reserved}"), val);
+                    }
+                }
                 records.push(FlatRecord {
                     slot,
                     block_time,
