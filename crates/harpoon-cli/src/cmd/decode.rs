@@ -1,11 +1,14 @@
 //! `harpoon decode` — offline decode: apply IDL to existing raw data.
+//!
+//! Reads raw Parquet/JSONL files, decodes instructions via IDL, and writes
+//! flat records partitioned by instruction name into subdirectories
+//! (same layout as `harpoon ingest --extract instructions`).
 
 use {
     anyhow::Context,
-    harpoon_decode::IdlDecoder,
+    harpoon_decode::{Idl, IdlDecoder},
     harpoon_export::{
-        OutputFormat, PartitionedWriter, TransactionRecord,
-        record::InstructionRecord,
+        FlatPartitionedWriter, FlatRecord, OutputFormat, TransactionRecord,
     },
     std::path::Path,
 };
@@ -16,8 +19,12 @@ pub async fn run(
     output_dir: &Path,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let decoder =
-        IdlDecoder::from_idl_path(idl_path).with_context(|| format!("load IDL: {idl_path:?}"))?;
+    let idl_json =
+        std::fs::read_to_string(idl_path).with_context(|| format!("read IDL: {idl_path:?}"))?;
+    let idl: Idl =
+        serde_json::from_str(&idl_json).with_context(|| format!("parse IDL: {idl_path:?}"))?;
+    let schemas = crate::pipeline::build_extract_schemas(&idl, crate::pipeline::ExtractMode::Instructions);
+    let decoder = IdlDecoder::from_idl(idl);
 
     // Find input files
     let mut inputs: Vec<_> = std::fs::read_dir(input_dir)
@@ -42,70 +49,93 @@ pub async fn run(
         inputs.len()
     );
 
-    let mut pw = PartitionedWriter::new(output_dir, format, 50_000)?;
-
     for input_path in &inputs {
         eprintln!("  Processing {input_path:?}");
+        let epoch = extract_epoch_from_filename(input_path);
+        let mut pw = FlatPartitionedWriter::new(output_dir, format, schemas.clone(), epoch)?;
+
         let ext = input_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        match ext {
+        let decoded_count = match ext {
             "parquet" => decode_parquet_file(input_path, &decoder, &mut pw)?,
             "jsonl" => decode_jsonl_file(input_path, &decoder, &mut pw)?,
             other => {
                 eprintln!("  [skip] unsupported input format: {other}");
+                continue;
             }
-        }
+        };
+
+        pw.finish()?;
+        eprintln!("    decoded {decoded_count} instructions");
     }
 
-    pw.finish()?;
     eprintln!("Decode complete → {output_dir:?}");
     Ok(())
 }
 
+/// Extract epoch number from filenames like `epoch-945.parquet`.
+/// Falls back to 0 if the pattern doesn't match.
+fn extract_epoch_from_filename(path: &Path) -> u64 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| {
+            s.strip_prefix("epoch-")
+                .or_else(|| s.strip_prefix("epoch_"))
+                .and_then(|rest| rest.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+const RESERVED_NAMES: &[&str] = &["slot", "block_time", "signature", "name", "program_id"];
+
 fn decode_records(
     records: impl Iterator<Item = TransactionRecord>,
     decoder: &IdlDecoder,
-    pw: &mut PartitionedWriter,
+    pw: &mut FlatPartitionedWriter,
 ) -> anyhow::Result<u64> {
-    let mut batch: Vec<TransactionRecord> = Vec::new();
+    let mut buffer: Vec<FlatRecord> = Vec::new();
     let mut decoded_count = 0u64;
 
     for record in records {
-        let mut decoded_instructions = Vec::new();
+        let signature = record.signatures.first().cloned().unwrap_or_default();
+
         for ix in &record.instructions {
             if let Ok(raw_bytes) = bs58::decode(&ix.data).into_vec() {
                 if let Some(Ok(decoded)) = decoder.try_decode_instruction(&raw_bytes) {
-                    decoded_instructions.push(InstructionRecord {
+                    let mut fields = match decoded.data {
+                        serde_json::Value::Object(map) => map,
+                        _ => serde_json::Map::new(),
+                    };
+                    // Rename fields that collide with FlatRecord common fields
+                    for reserved in RESERVED_NAMES {
+                        if let Some(val) = fields.remove(*reserved) {
+                            fields.insert(format!("token_{reserved}"), val);
+                        }
+                    }
+                    buffer.push(FlatRecord {
+                        slot: record.slot,
+                        block_time: record.block_time,
+                        signature: signature.clone(),
+                        name: decoded.name,
                         program_id: ix.program_id.clone(),
-                        data: serde_json::to_string(&serde_json::json!({
-                            "name": decoded.name,
-                            "args": decoded.data,
-                        }))?,
-                        accounts: ix.accounts.clone(),
+                        fields,
                     });
                     decoded_count += 1;
-                    continue;
                 }
             }
-            // Keep original if decode fails
-            decoded_instructions.push(ix.clone());
         }
 
-        let mut decoded_record = record;
-        decoded_record.instructions = decoded_instructions;
-        batch.push(decoded_record);
-
-        if batch.len() >= 10_000 {
-            pw.write_partitioned(&batch, partition_key)?;
-            batch.clear();
+        if buffer.len() >= 10_000 {
+            pw.write_records(&buffer)?;
+            buffer.clear();
         }
     }
 
-    if !batch.is_empty() {
-        pw.write_partitioned(&batch, partition_key)?;
+    if !buffer.is_empty() {
+        pw.write_records(&buffer)?;
     }
 
     Ok(decoded_count)
@@ -114,12 +144,11 @@ fn decode_records(
 fn decode_parquet_file(
     path: &Path,
     decoder: &IdlDecoder,
-    pw: &mut PartitionedWriter,
-) -> anyhow::Result<()> {
+    pw: &mut FlatPartitionedWriter,
+) -> anyhow::Result<u64> {
     let iter = harpoon_export::read_parquet_records(path)
         .with_context(|| format!("open parquet: {path:?}"))?;
 
-    // Filter out read errors, logging them
     let records = iter.filter_map(|r| match r {
         Ok(rec) => Some(rec),
         Err(e) => {
@@ -128,16 +157,14 @@ fn decode_parquet_file(
         }
     });
 
-    let decoded_count = decode_records(records, decoder, pw)?;
-    eprintln!("    decoded {decoded_count} instructions");
-    Ok(())
+    decode_records(records, decoder, pw)
 }
 
 fn decode_jsonl_file(
     path: &Path,
     decoder: &IdlDecoder,
-    pw: &mut PartitionedWriter,
-) -> anyhow::Result<()> {
+    pw: &mut FlatPartitionedWriter,
+) -> anyhow::Result<u64> {
     use std::io::{BufRead, BufReader};
 
     let file = std::fs::File::open(path)?;
@@ -148,21 +175,5 @@ fn decode_jsonl_file(
         serde_json::from_str::<TransactionRecord>(&line).ok()
     });
 
-    let decoded_count = decode_records(records, decoder, pw)?;
-    eprintln!("    decoded {decoded_count} instructions");
-    Ok(())
-}
-
-/// Partition key: first decoded instruction name, or "unknown".
-fn partition_key(r: &TransactionRecord) -> String {
-    for ix in &r.instructions {
-        if ix.data.starts_with('{') {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ix.data) {
-                if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                    return name.to_string();
-                }
-            }
-        }
-    }
-    "unknown".to_string()
+    decode_records(records, decoder, pw)
 }
