@@ -42,8 +42,6 @@ pub async fn run(
         inputs.len()
     );
 
-    // For now, support JSONL input → partitioned output by instruction name.
-    // Parquet input decoding can be added later.
     let mut pw = PartitionedWriter::new(output_dir, format, 50_000)?;
 
     for input_path in &inputs {
@@ -54,6 +52,7 @@ pub async fn run(
             .unwrap_or("");
 
         match ext {
+            "parquet" => decode_parquet_file(input_path, &decoder, &mut pw)?,
             "jsonl" => decode_jsonl_file(input_path, &decoder, &mut pw)?,
             other => {
                 eprintln!("  [skip] unsupported input format: {other}");
@@ -66,23 +65,15 @@ pub async fn run(
     Ok(())
 }
 
-fn decode_jsonl_file(
-    path: &Path,
+fn decode_records(
+    records: impl Iterator<Item = TransactionRecord>,
     decoder: &IdlDecoder,
     pw: &mut PartitionedWriter,
-) -> anyhow::Result<()> {
-    use std::io::{BufRead, BufReader};
-
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
+) -> anyhow::Result<u64> {
     let mut batch: Vec<TransactionRecord> = Vec::new();
     let mut decoded_count = 0u64;
 
-    for line in reader.lines() {
-        let line = line?;
-        let record: TransactionRecord = serde_json::from_str(&line)?;
-
-        // Decode each instruction via IDL
+    for record in records {
         let mut decoded_instructions = Vec::new();
         for ix in &record.instructions {
             if let Ok(raw_bytes) = bs58::decode(&ix.data).into_vec() {
@@ -117,6 +108,47 @@ fn decode_jsonl_file(
         pw.write_partitioned(&batch, partition_key)?;
     }
 
+    Ok(decoded_count)
+}
+
+fn decode_parquet_file(
+    path: &Path,
+    decoder: &IdlDecoder,
+    pw: &mut PartitionedWriter,
+) -> anyhow::Result<()> {
+    let iter = harpoon_export::read_parquet_records(path)
+        .with_context(|| format!("open parquet: {path:?}"))?;
+
+    // Filter out read errors, logging them
+    let records = iter.filter_map(|r| match r {
+        Ok(rec) => Some(rec),
+        Err(e) => {
+            eprintln!("    [warn] skipping record: {e}");
+            None
+        }
+    });
+
+    let decoded_count = decode_records(records, decoder, pw)?;
+    eprintln!("    decoded {decoded_count} instructions");
+    Ok(())
+}
+
+fn decode_jsonl_file(
+    path: &Path,
+    decoder: &IdlDecoder,
+    pw: &mut PartitionedWriter,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let records = reader.lines().filter_map(|line| {
+        let line = line.ok()?;
+        serde_json::from_str::<TransactionRecord>(&line).ok()
+    });
+
+    let decoded_count = decode_records(records, decoder, pw)?;
     eprintln!("    decoded {decoded_count} instructions");
     Ok(())
 }

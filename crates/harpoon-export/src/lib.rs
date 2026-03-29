@@ -1,9 +1,11 @@
+pub mod reader;
 pub mod record;
 pub mod schema;
 pub mod writer;
 
 pub use {
     arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, SchemaRef as ArrowSchemaRef},
+    reader::read_parquet_records,
     record::{
         AccountBalanceDelta, FlatRecord, InstructionRecord, TokenBalanceDelta, TransactionRecord,
     },
