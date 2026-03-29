@@ -79,6 +79,10 @@ enum Commands {
         /// Output format: parquet, csv, jsonl.
         #[arg(long, default_value = "parquet")]
         format: String,
+
+        /// What to extract: events, instructions, or both (default).
+        #[arg(long, default_value = "both")]
+        extract: String,
     },
 
     /// Print statistics about a CAR file or epoch.
@@ -99,6 +103,15 @@ fn parse_extract_mode(s: &str) -> anyhow::Result<pipeline::ExtractMode> {
         "events" => Ok(pipeline::ExtractMode::Events),
         "instructions" => Ok(pipeline::ExtractMode::Instructions),
         other => anyhow::bail!("unknown extract mode: {other} (expected: raw, events, instructions)"),
+    }
+}
+
+fn parse_decode_mode(s: &str) -> anyhow::Result<cmd::decode::DecodeMode> {
+    match s {
+        "events" => Ok(cmd::decode::DecodeMode::Events),
+        "instructions" => Ok(cmd::decode::DecodeMode::Instructions),
+        "both" => Ok(cmd::decode::DecodeMode::Both),
+        other => anyhow::bail!("unknown decode extract mode: {other} (expected: events, instructions, both)"),
     }
 }
 
@@ -163,7 +176,11 @@ async fn main() -> anyhow::Result<()> {
             input,
             output,
             format,
-        } => cmd::decode::run(&idl, &input, &output, parse_output_format(&format)?).await,
+            extract,
+        } => {
+            let mode = parse_decode_mode(&extract)?;
+            cmd::decode::run(&idl, &input, &output, parse_output_format(&format)?, mode).await
+        }
         Commands::Inspect { car, epoch } => cmd::inspect::run(car.as_deref(), epoch).await,
     }
 }
